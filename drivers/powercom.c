@@ -331,7 +331,7 @@ static void shutdown_ret(void)
 /* registered instant commands */
 static int instcmd (const char *cmdname, const char *extra)
 {
-	unsigned char cmd_buf[8];
+	char cmd_buf[8];
 	int cmd_len;
 	
 	/* May be used in logging below, but not as a command argument */
@@ -557,7 +557,7 @@ static int parse_com2_status(const char *status_str, unsigned char *bits)
  */
 static int ups_getinfo_com2(void)
 {
-	unsigned char cmd_buf[8];
+	char cmd_buf[8];
 	unsigned char response[128];
 	ssize_t ret;
 	int cmd_len;
