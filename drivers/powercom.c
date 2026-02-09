@@ -124,7 +124,7 @@ static enum protocol_mode current_protocol = PROTOCOL_AUTO;
 static enum protocol_mode configured_protocol = PROTOCOL_AUTO;
 static struct com2_data com2_current;
 static struct event_state event_tracking;
-static const char *com2_command = "Q1";  /* Q1 or DQ1 */
+static unsigned int com2_iteration = 0;  /* Alternates between Q1 and DQ1 like Java driver */
 static unsigned int event_hold_time = 20;  /* seconds to latch events */
 static int allow_control = 0;  /* allow dangerous commands */
 static time_t last_mode_switch = 0;
@@ -566,18 +566,32 @@ static int ups_getinfo_com2(void)
 	int field_count = 0;
 	char response_copy[128];
 	
-	/* Prepare command: Q1\r or DQ1\r */
-	if (!strcmp(com2_command, "DQ1")) {
+	/* Alternate between DQ1 (even) and Q1 (odd) like the original Java driver
+	 * ConCOM2Set.java lines 186-194:
+	 *   if (roopINT % 2 == 0) { write(a1); }  // DQ1
+	 *   else { write(a2); }                   // Q1
+	 */
+	if (com2_iteration % 2 == 0) {
+		/* Even iteration: DQ1 command */
 		cmd_buf[0] = 'D';
 		cmd_buf[1] = 'Q';
 		cmd_buf[2] = '1';
 		cmd_buf[3] = '\r';
 		cmd_len = 4;
+		upsdebugx(3, "COM2: Sending DQ1 command (iteration %u)", com2_iteration);
 	} else {
+		/* Odd iteration: Q1 command */
 		cmd_buf[0] = 'Q';
 		cmd_buf[1] = '1';
 		cmd_buf[2] = '\r';
 		cmd_len = 3;
+		upsdebugx(3, "COM2: Sending Q1 command (iteration %u)", com2_iteration);
+	}
+	
+	/* Increment iteration counter, reset at 1000 like Java driver */
+	com2_iteration++;
+	if (com2_iteration >= 1000) {
+		com2_iteration = 20;  /* Reset to 20, not 0, like Java driver */
 	}
 	
 	/* Send command with pacing */
@@ -1433,17 +1447,9 @@ void upsdrv_initups(void)
 		}
 	}
 	
-	if (testvar("com2_command")) {
-		val = getval("com2_command");
-		if (!strcasecmp(val, "Q1")) {
-			com2_command = "Q1";
-		} else if (!strcasecmp(val, "DQ1")) {
-			com2_command = "DQ1";
-		} else {
-			fatalx(EXIT_FAILURE, "Invalid com2_command '%s' (must be Q1 or DQ1)", val);
-		}
-		upsdebugx(1, "COM2 command set to: %s", com2_command);
-	}
+	/* com2_command option removed - driver now automatically alternates between Q1 and DQ1
+	 * like the original Java driver (ConCOM2Set.java lines 186-194)
+	 */
 	
 	if (testvar("event_hold")) {
 		char *endptr = NULL;
@@ -1631,7 +1637,8 @@ void upsdrv_help(void)
 	printf("                 auto: tries COM1 first, then COM2 if COM1 fails\n");
 	printf("                 com1: binary protocol at 1200 baud (original)\n");
 	printf("                 com2: ASCII protocol at 2400 baud (newer models)\n");
-	printf(" com2_command:  Query command for COM2: 'Q1' or 'DQ1' (default: 'Q1')\n");
+	printf("                NOTE: COM2 automatically alternates between Q1 and DQ1 commands\n");
+	printf("                      like the original Java driver (no configuration needed)\n");
 	printf(" event_hold:    Event latch time in seconds (default: 20, range: 1-300)\n");
 	printf(" allow_control: Enable dangerous commands: 'yes' or 'no' (default: 'no')\n");
 	printf("                When 'yes', enables shutdown.stayoff.dangerous command\n");
@@ -1701,9 +1708,9 @@ void upsdrv_help(void)
 	printf("    port = /dev/ttyS0\n");
 	printf("    desc = \"PowerCom Imperial with COM2 protocol\"\n");
 	printf("    protocol_mode = com2\n");
-	printf("    com2_command = Q1\n");
 	printf("    event_hold = 20\n");
 	printf("#   allow_control = yes  # Enable dangerous commands\n");
+	printf("# NOTE: COM2 automatically alternates between Q1 and DQ1 commands\n");
 	return;
 }
 
@@ -1839,8 +1846,7 @@ void upsdrv_makevartable(void)
 	/* COM2 protocol options */
 	addvar(VAR_VALUE, "protocol_mode",
 		"Protocol mode: 'auto', 'com1', or 'com2' (default: auto)");
-	addvar(VAR_VALUE, "com2_command",
-		"COM2 query command: 'Q1' or 'DQ1' (default: Q1)");
+	/* com2_command removed - driver automatically alternates Q1/DQ1 like Java driver */
 	addvar(VAR_VALUE, "event_hold",
 		"Event latch duration in seconds (default: 20, range: 1-300)");
 	addvar(VAR_VALUE, "allow_control",
