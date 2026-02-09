@@ -522,10 +522,19 @@ static int ups_getinfo(void)
  */
 static int parse_com2_status(const char *status_str, unsigned char *bits)
 {
+	size_t len;
 	int i;
-	if (strlen(status_str) != 8) {
+	
+	/* Ensure string is null-terminated and has valid length */
+	if (!status_str) {
 		return 0;
 	}
+	
+	len = strnlen(status_str, 16);  /* Check up to 16 chars max */
+	if (len != 8) {
+		return 0;
+	}
+	
 	for (i = 0; i < 8; i++) {
 		if (status_str[i] < '0' || status_str[i] > '3') {
 			return 0;
@@ -534,6 +543,12 @@ static int parse_com2_status(const char *status_str, unsigned char *bits)
 	}
 	return 1;
 }
+
+/* COM2: Minimum response length for valid COM2 response
+ * Format: "(InputV OutputV Load Freq BattLevel Temp Status"
+ * Minimum example: "(100 200 10 50.0 100 25 00000000" = 46 bytes
+ */
+#define COM2_MIN_RESPONSE_LEN 46
 
 /* COM2: Send command and read ASCII response
  * Command: Q1 or DQ1 followed by \r
@@ -550,7 +565,6 @@ static int ups_getinfo_com2(void)
 	char *saveptr = NULL;
 	int field_count = 0;
 	char response_copy[128];
-	int i;
 	
 	/* Prepare command: Q1\r or DQ1\r */
 	if (!strcmp(com2_command, "DQ1")) {
@@ -577,8 +591,8 @@ static int ups_getinfo_com2(void)
 	memset(response, 0, sizeof(response));
 	ret = ser_get_buf_len(upsfd, response, sizeof(response) - 1, 3, 0);
 	
-	if (ret < 46) {
-		upsdebugx(2, "COM2: Response too short (%" PRIiSIZE " bytes, expected >= 46)", ret);
+	if (ret < COM2_MIN_RESPONSE_LEN) {
+		upsdebugx(2, "COM2: Response too short (%" PRIiSIZE " bytes, expected >= %d)", ret, COM2_MIN_RESPONSE_LEN);
 		return 0;
 	}
 	
@@ -590,8 +604,8 @@ static int ups_getinfo_com2(void)
 		return 0;
 	}
 	
-	/* Parse space-separated fields */
-	snprintf(response_copy, sizeof(response_copy), "%s", (char *)response);
+	/* Parse space-separated fields - response is null-terminated by ser_get_buf_len */
+	snprintf(response_copy, sizeof(response_copy), "%s", response);
 	
 	/* Skip opening '(' and parse fields */
 	token = strtok_r(response_copy, " ", &saveptr);
@@ -749,13 +763,36 @@ static void com2_update_vars(void)
 	dstate_setinfo("ups.load", "%.1f", com2_current.load);
 	dstate_setinfo("input.frequency", "%.1f", com2_current.frequency);
 	
-	/* Battery level (could be % or voltage depending on decimal presence) */
+	/* Battery level (could be % or voltage depending on value range)
+	 * Heuristic: If > 50, assume percentage (0-100%)
+	 * If <= 50, check if it's in valid battery voltage range (10-60V)
+	 * Typical UPS battery voltages: 12V, 24V, 36V, 48V systems
+	 */
 	if (com2_current.battery_level > 50.0) {
-		/* Likely percentage */
+		/* Likely percentage (50-100%) */
 		dstate_setinfo("battery.charge", "%.1f", com2_current.battery_level);
+	} else if (com2_current.battery_level >= 10.0 && com2_current.battery_level <= 50.0) {
+		/* Ambiguous range - could be low percentage or voltage
+		 * Check if value looks like typical battery voltage */
+		if (com2_current.battery_level >= 11.0 && com2_current.battery_level <= 14.0) {
+			/* 12V system voltage range */
+			dstate_setinfo("battery.voltage", "%.2f", com2_current.battery_level);
+		} else if (com2_current.battery_level >= 22.0 && com2_current.battery_level <= 28.0) {
+			/* 24V system voltage range */
+			dstate_setinfo("battery.voltage", "%.2f", com2_current.battery_level);
+		} else if (com2_current.battery_level >= 33.0 && com2_current.battery_level <= 40.0) {
+			/* 36V system voltage range */
+			dstate_setinfo("battery.voltage", "%.2f", com2_current.battery_level);
+		} else if (com2_current.battery_level >= 44.0 && com2_current.battery_level <= 50.0) {
+			/* 48V system voltage range */
+			dstate_setinfo("battery.voltage", "%.2f", com2_current.battery_level);
+		} else {
+			/* Otherwise assume percentage */
+			dstate_setinfo("battery.charge", "%.1f", com2_current.battery_level);
+		}
 	} else {
-		/* Likely voltage */
-		dstate_setinfo("battery.voltage", "%.2f", com2_current.battery_level);
+		/* Very low value - likely percentage */
+		dstate_setinfo("battery.charge", "%.1f", com2_current.battery_level);
 	}
 	
 	/* Temperature */
@@ -801,12 +838,14 @@ static void com2_update_vars(void)
 		}
 	}
 	
-	/* b4: UPS fault */
+	/* b4: UPS fault (status_bits[3] represents b4) */
 	if (com2_current.status_bits[3] == 1) {
 		alarm_set("UPS fault");
 	}
 	
-	/* b3: Battery fault (values 2 or 3) */
+	/* b3: Online/Offline/Battery fault status (status_bits[4] represents b3)
+	 * Values: 0=Online, 1=Offline, 2/3=Battery fault
+	 */
 	if (com2_current.status_bits[4] >= 2) {
 		status_set("RB");  /* Replace battery */
 	}
@@ -864,10 +903,16 @@ static int detect_protocol(void)
 		return 1;
 	}
 	
-	/* Auto-detection: Try COM1 first (1200 baud) */
+	/* Try COM1 (2400 baud) */
 	if (current_protocol == PROTOCOL_AUTO || current_protocol == PROTOCOL_COM1) {
 		ser_set_speed(upsfd, device_path, B1200);
-		usleep(100000);  /* 100ms settling time */
+		/* Allow serial port to settle after baud rate change */
+		{
+			struct timespec ts;
+			ts.tv_sec = 0;
+			ts.tv_nsec = 100000000L;  /* 100ms */
+			nanosleep(&ts, NULL);
+		}
 		
 		if (ups_getinfo()) {
 			com1_fail_count = 0;
@@ -885,7 +930,13 @@ static int detect_protocol(void)
 	/* Try COM2 (2400 baud) */
 	if (current_protocol == PROTOCOL_AUTO || current_protocol == PROTOCOL_COM2 || com1_fail_count >= 3) {
 		ser_set_speed(upsfd, device_path, B2400);
-		usleep(100000);  /* 100ms settling time */
+		/* Allow serial port to settle after baud rate change */
+		{
+			struct timespec ts;
+			ts.tv_sec = 0;
+			ts.tv_nsec = 100000000L;  /* 100ms */
+			nanosleep(&ts, NULL);
+		}
 		
 		if (ups_getinfo_com2()) {
 			com2_fail_count = 0;
@@ -1384,22 +1435,27 @@ void upsdrv_initups(void)
 	
 	if (testvar("com2_command")) {
 		val = getval("com2_command");
-		if (!strcasecmp(val, "Q1") || !strcasecmp(val, "DQ1")) {
-			com2_command = val;
-			upsdebugx(1, "COM2 command set to: %s", com2_command);
+		if (!strcasecmp(val, "Q1")) {
+			com2_command = "Q1";
+		} else if (!strcasecmp(val, "DQ1")) {
+			com2_command = "DQ1";
 		} else {
 			fatalx(EXIT_FAILURE, "Invalid com2_command '%s' (must be Q1 or DQ1)", val);
 		}
+		upsdebugx(1, "COM2 command set to: %s", com2_command);
 	}
 	
 	if (testvar("event_hold")) {
-		tmp = atoi(getval("event_hold"));
-		if (tmp > 0 && tmp <= 300) {
-			event_hold_time = (unsigned int)tmp;
-			upsdebugx(1, "Event hold time set to: %u seconds", event_hold_time);
-		} else {
-			fatalx(EXIT_FAILURE, "Invalid event_hold '%d' (must be 1-300 seconds)", tmp);
+		char *endptr = NULL;
+		long tmpval;
+		val = getval("event_hold");
+		
+		tmpval = strtol(val, &endptr, 10);
+		if (endptr == val || *endptr != '\0' || tmpval <= 0 || tmpval > 300) {
+			fatalx(EXIT_FAILURE, "Invalid event_hold '%s' (must be 1-300 seconds)", val);
 		}
+		event_hold_time = (unsigned int)tmpval;
+		upsdebugx(1, "Event hold time set to: %u seconds", event_hold_time);
 	}
 	
 	if (testvar("allow_control")) {
