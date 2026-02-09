@@ -382,6 +382,19 @@ static int instcmd (const char *cmdname, const char *extra)
 			return STAT_INSTCMD_FAILED;
 		}
 		
+		/* beeper.enable and beeper.disable use same Q command (toggle) */
+		if (!strcasecmp(cmdname, "beeper.enable") || !strcasecmp(cmdname, "beeper.disable")) {
+			/* COM2: Q command toggles beeper */
+			cmd_buf[0] = 'Q';
+			cmd_buf[1] = '\r';
+			cmd_len = 2;
+			if (ser_send_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				upslogx(LOG_INFO, "Beeper toggled (current state will change)");
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		}
+		
 		/* Dangerous commands - require allow_control=yes */
 		if (!strcasecmp(cmdname, "shutdown.stayoff.dangerous")) {
 			if (!allow_control) {
@@ -807,6 +820,25 @@ static void com2_update_vars(void)
 	} else {
 		/* Very low value - likely percentage */
 		dstate_setinfo("battery.charge", "%.1f", com2_current.battery_level);
+	}
+	
+	/* Estimate battery runtime based on charge and load */
+	if (com2_current.battery_level > 50 && com2_current.load > 0) {
+		/* Simple runtime estimation: assume 30 min at 100% load, scale by charge and load */
+		/* Runtime = (charge/100) * (base_runtime) * (100/load) */
+		float base_runtime_minutes = 30.0; /* Typical for small UPS at full load */
+		float estimated_runtime = (com2_current.battery_level / 100.0) * base_runtime_minutes * (100.0 / com2_current.load);
+		
+		/* Cap at reasonable maximum (10 hours = 600 minutes) */
+		if (estimated_runtime > 600.0) {
+			estimated_runtime = 600.0;
+		}
+		
+		/* Convert to seconds and set */
+		dstate_setinfo("battery.runtime", "%.0f", estimated_runtime * 60.0);
+		
+		/* Set low runtime threshold at 5 minutes (300 seconds) */
+		dstate_setinfo("battery.runtime.low", "300");
 	}
 	
 	/* Temperature */
@@ -1927,6 +1959,47 @@ void upsdrv_initinfo(void)
 	dstate_setinfo ("ups.serial", "%s", serialnumber);
 	dstate_setinfo ("ups.model.type", "%s", types[type].name);
 	dstate_setinfo ("input.voltage.nominal", "%u", linevoltage);
+	
+	/* Add output.voltage.nominal (same as input for line-interactive UPS) */
+	dstate_setinfo ("output.voltage.nominal", "%u", linevoltage);
+	
+	/* Add ups.power.nominal (VA rating from model number) if detected */
+	if (!strncmp(types[type].name, "BNT",3) || !strcmp(types[type].name, "KIN") || 
+	    !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI")) {
+		unsigned int model = 0;
+		
+		/* Extract model power rating */
+		if (!strcmp(types[type].name, "IMP")) {
+			model = IMPmodels[raw_data[MODELNUMBER]/16];
+		} else if (!strcmp(types[type].name, "KIN")) {
+			model = KINmodels[raw_data[MODELNUMBER]/16];
+		} else if (!strncmp(types[type].name, "BNT",3)) {
+			model = BNTmodels[raw_data[MODELNUMBER]/16];
+		} else if (!strcmp(types[type].name, "OPTI")) {
+			model = OPTImodels[raw_data[MODELNUMBER]/16];
+		}
+		
+		if (model > 0) {
+			dstate_setinfo("ups.power.nominal", "%u", model);
+			/* Estimate real power at 0.6 power factor (typical for UPS) */
+			dstate_setinfo("ups.realpower.nominal", "%u", (unsigned int)(model * 0.6));
+		}
+	}
+	
+	/* Add battery.voltage.nominal based on detected system */
+	if (current_protocol == PROTOCOL_COM2 && com2_current.battery_level > 0) {
+		/* Try to detect battery system voltage from current reading */
+		float batt_v = com2_current.battery_level;
+		if (batt_v >= 11.0 && batt_v <= 14.0) {
+			dstate_setinfo("battery.voltage.nominal", "12.0");
+		} else if (batt_v >= 22.0 && batt_v <= 28.0) {
+			dstate_setinfo("battery.voltage.nominal", "24.0");
+		} else if (batt_v >= 33.0 && batt_v <= 40.0) {
+			dstate_setinfo("battery.voltage.nominal", "36.0");
+		} else if (batt_v >= 44.0 && batt_v <= 50.0) {
+			dstate_setinfo("battery.voltage.nominal", "48.0");
+		}
+	}
 
 	/* now add the instant commands */
 	dstate_addcmd ("test.battery.start");
@@ -1937,6 +2010,8 @@ void upsdrv_initinfo(void)
 	if (configured_protocol == PROTOCOL_COM2 || configured_protocol == PROTOCOL_AUTO) {
 		dstate_addcmd ("test.battery.stop");
 		dstate_addcmd ("beeper.toggle");
+		dstate_addcmd ("beeper.enable");
+		dstate_addcmd ("beeper.disable");
 		if (allow_control) {
 			dstate_addcmd ("shutdown.stayoff.dangerous");
 			upslogx(LOG_WARNING, "Dangerous shutdown commands enabled");
