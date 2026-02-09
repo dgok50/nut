@@ -12,6 +12,35 @@ make -C drivers powercom
 
 ---
 
+## Prerequisites / Предварительные требования
+
+Before building, install required tools / Перед сборкой установите необходимые инструменты:
+
+### Fedora/RHEL/CentOS:
+```bash
+sudo dnf install gcc make libtool autoconf automake pkgconfig git
+```
+
+### Ubuntu/Debian:
+```bash
+sudo apt-get install build-essential libtool libtool-bin autoconf automake pkg-config git
+```
+
+### OpenWrt:
+```bash
+opkg update
+opkg install gcc make libtool autoconf automake pkgconfig
+```
+
+**Why these packages? / Зачем эти пакеты?**
+- `gcc`, `make` - Compiler and build tools / Компилятор и инструменты сборки
+- `libtool` - Provides `libtoolize` command / Предоставляет команду `libtoolize`
+- `autoconf`, `automake` - Generate configure scripts / Генерация скриптов configure
+- `pkgconfig` - Manage library dependencies / Управление зависимостями библиотек
+- `git` - Clone repository / Клонирование репозитория
+
+---
+
 ## Minimal Build / Минимальная сборка
 
 ### Method 1: Standard Minimal Build / Стандартная минимальная сборка
@@ -219,6 +248,46 @@ make  # Builds EVERYTHING (10+ minutes)
 ---
 
 ## Troubleshooting / Устранение неполадок
+
+### Error: "Can't exec 'libtoolize': No such file or directory"
+
+**Full error:**
+```
+autoreconf: running: libtoolize --copy
+Can't exec "libtoolize": No such file or directory
+autoreconf: error: libtoolize failed with exit status: 2
+```
+
+**Cause / Причина:** The `libtool` package is not installed.
+
+**Solution / Решение:**
+```bash
+# Fedora/RHEL/CentOS:
+sudo dnf install libtool
+
+# Ubuntu/Debian:
+sudo apt-get install libtool libtool-bin
+
+# OpenWrt:
+opkg install libtool
+
+# Then run autogen.sh again:
+./autogen.sh
+```
+
+**Install all build dependencies at once / Установить все зависимости сразу:**
+```bash
+# Fedora:
+sudo dnf install gcc make libtool autoconf automake pkgconfig
+
+# Ubuntu/Debian:
+sudo apt-get install build-essential libtool libtool-bin autoconf automake pkg-config
+
+# OpenWrt:
+opkg install gcc make libtool autoconf automake pkgconfig
+```
+
+---
 
 ### Error: "configure: command not found"
 

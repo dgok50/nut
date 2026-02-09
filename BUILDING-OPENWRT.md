@@ -464,6 +464,44 @@ chmod 640 /etc/nut/ups.conf
 
 ## Troubleshooting / Устранение неполадок
 
+### Error: "Can't exec 'libtoolize': No such file or directory"
+
+**Full error:**
+```
+autoreconf: running: libtoolize --copy
+Can't exec "libtoolize": No such file or directory at /usr/share/autoconf/Autom4te/FileUtils.pm line %.
+autoreconf: error: libtoolize failed with exit status: 2
+```
+
+**Причина / Cause:** The `libtool` package is not installed on the system.
+
+**Решение / Solution:**
+```bash
+# OpenWrt:
+opkg update
+opkg install libtool
+
+# Then run autogen.sh again / Затем запустить autogen.sh снова:
+./autogen.sh
+```
+
+**Install all build tools at once / Установить все инструменты сразу:**
+```bash
+opkg update
+opkg install gcc make libtool autoconf automake pkgconfig
+```
+
+**On development machine (Fedora/Ubuntu) / На машине разработки:**
+```bash
+# Fedora:
+sudo dnf install libtool
+
+# Ubuntu/Debian:
+sudo apt-get install libtool libtool-bin
+```
+
+---
+
 ### Error: "cannot execute binary file"
 
 **Причина / Cause:** Wrong architecture or libraries
