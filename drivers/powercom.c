@@ -1725,9 +1725,18 @@ void upsdrv_initinfo(void)
 	unsigned int	model = 0;
 	static char	buf[20];
 
-	/* Setup Model and LineVoltage */
-	if (!strncmp(types[type].name, "BNT",3) || !strcmp(types[type].name, "KIN") || !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI")) {
-		if (!ups_getinfo()) return;
+	/* Auto-detect protocol (COM1 or COM2) like Java driver */
+	if (!detect_protocol()) {
+		upslogx(LOG_ERR, "Failed to detect UPS protocol (tried COM1 and COM2)");
+		dstate_datastale();
+		return;
+	}
+	
+	/* Setup Model and LineVoltage - only for COM1 (binary protocol) */
+	/* COM2 (ASCII protocol) doesn't have model detection bytes */
+	if (current_protocol == PROTOCOL_COM1 && 
+	    (!strncmp(types[type].name, "BNT",3) || !strcmp(types[type].name, "KIN") || !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI"))) {
+		/* Note: detect_protocol() already called ups_getinfo() successfully */
 		/* Give "BNT-other" a chance! */
 		if (raw_data[MODELNAME]==0x42 || raw_data[MODELNAME]==0x4B || raw_data[MODELNAME]==0x4F){
 			/* Give "IMP" a chance also! */
@@ -1763,6 +1772,8 @@ void upsdrv_initinfo(void)
 		if (!strcmp(modelname, "Unknown"))
 			modelname=buf;
 		upsdebugx(1, "Detected: %s , %uV", buf, linevoltage);
+		
+		/* Battery test command is COM1-specific */
 		if (testvar("nobt") || dstate_getinfo("driver.flag.nobt")) {
 			upslogx(LOG_NOTICE, "nobt flag set, skipping battery test as requested");
 		}
@@ -1774,6 +1785,11 @@ void upsdrv_initinfo(void)
 				return;
 			}
 		}
+	} else if (current_protocol == PROTOCOL_COM2) {
+		/* COM2 protocol detected - use modelname from config or Unknown */
+		upsdebugx(1, "Using COM2 protocol (ASCII, 2400 baud)");
+		upsdebugx(1, "Model: %s (from config)", modelname);
+		/* Battery test for COM2 uses different commands (handled via instcmd) */
 	}
 
 	upsdebugx(1, "Values of arguments:");
