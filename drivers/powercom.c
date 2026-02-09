@@ -902,6 +902,7 @@ static void com2_update_vars(void)
 static int detect_protocol(void)
 {
 	time_t now = time(NULL);
+	static int protocol_detected = 0;  /* One-time detection flag */
 	
 	/* Check cooldown period (10 seconds minimum between switches) */
 	if (last_mode_switch > 0 && (now - last_mode_switch) < 10) {
@@ -909,7 +910,7 @@ static int detect_protocol(void)
 		return (current_protocol == PROTOCOL_COM1 || current_protocol == PROTOCOL_COM2) ? 1 : 0;
 	}
 	
-	/* If configured protocol is set, try it first */
+	/* If configured protocol is set, use it (manual override) */
 	if (configured_protocol != PROTOCOL_AUTO) {
 		current_protocol = configured_protocol;
 		last_mode_switch = now;
@@ -917,34 +918,106 @@ static int detect_protocol(void)
 		return 1;
 	}
 	
-	/* Try COM1 (2400 baud) */
-	if (current_protocol == PROTOCOL_AUTO || current_protocol == PROTOCOL_COM1) {
+	/* First-time detection: try both protocols to find the best one */
+	if (!protocol_detected && current_protocol == PROTOCOL_AUTO) {
+		int com1_works = 0;
+		int com2_works = 0;
+		
+		upsdebugx(1, "First-time protocol detection: probing COM1 and COM2");
+		
+		/* Probe COM1 at 1200 baud */
 		ser_set_speed(upsfd, device_path, B1200);
-		/* Allow serial port to settle after baud rate change */
 		{
 			struct timespec ts;
 			ts.tv_sec = 0;
 			ts.tv_nsec = 100000000L;  /* 100ms */
 			nanosleep(&ts, NULL);
 		}
-		
 		if (ups_getinfo()) {
-			com1_fail_count = 0;
-			if (current_protocol != PROTOCOL_COM1) {
-				current_protocol = PROTOCOL_COM1;
-				last_mode_switch = now;
-				upsdebugx(1, "Auto-detected protocol: COM1 (binary, 1200 baud)");
-			}
+			com1_works = 1;
+			upsdebugx(1, "COM1 (1200 baud, binary) responds");
+		}
+		
+		/* Probe COM2 at 2400 baud */
+		ser_set_speed(upsfd, device_path, B2400);
+		{
+			struct timespec ts;
+			ts.tv_sec = 0;
+			ts.tv_nsec = 100000000L;  /* 100ms */
+			nanosleep(&ts, NULL);
+		}
+		if (ups_getinfo_com2()) {
+			com2_works = 1;
+			upsdebugx(1, "COM2 (2400 baud, ASCII) responds");
+		}
+		
+		/* Prefer COM2 if both work (richer protocol, like Java driver preference) */
+		if (com2_works) {
+			current_protocol = PROTOCOL_COM2;
+			ser_set_speed(upsfd, device_path, B2400);
+			protocol_detected = 1;
+			last_mode_switch = now;
+			upslogx(LOG_INFO, "Auto-detected protocol: COM2 (ASCII, 2400 baud) - preferred");
 			return 1;
-		} else {
-			com1_fail_count++;
+		} else if (com1_works) {
+			current_protocol = PROTOCOL_COM1;
+			ser_set_speed(upsfd, device_path, B1200);
+			protocol_detected = 1;
+			last_mode_switch = now;
+			upslogx(LOG_INFO, "Auto-detected protocol: COM1 (binary, 1200 baud) - fallback");
+			return 1;
+		}
+		
+		/* Neither protocol works on first try */
+		upsdebugx(1, "No protocol responded on first detection attempt");
+		return 0;
+	}
+	
+	/* After initial detection, stick with detected protocol unless it fails */
+	if (protocol_detected) {
+		if (current_protocol == PROTOCOL_COM1) {
+			ser_set_speed(upsfd, device_path, B1200);
+			{
+				struct timespec ts;
+				ts.tv_sec = 0;
+				ts.tv_nsec = 100000000L;  /* 100ms */
+				nanosleep(&ts, NULL);
+			}
+			
+			if (ups_getinfo()) {
+				com1_fail_count = 0;
+				return 1;
+			} else {
+				com1_fail_count++;
+				upsdebugx(2, "COM1 failed (count: %d)", com1_fail_count);
+			}
+		} else if (current_protocol == PROTOCOL_COM2) {
+			ser_set_speed(upsfd, device_path, B2400);
+			{
+				struct timespec ts;
+				ts.tv_sec = 0;
+				ts.tv_nsec = 100000000L;  /* 100ms */
+				nanosleep(&ts, NULL);
+			}
+			
+			if (ups_getinfo_com2()) {
+				com2_fail_count = 0;
+				return 1;
+			} else {
+				com2_fail_count++;
+				upsdebugx(2, "COM2 failed (count: %d)", com2_fail_count);
+			}
 		}
 	}
 	
-	/* Try COM2 (2400 baud) */
-	if (current_protocol == PROTOCOL_AUTO || current_protocol == PROTOCOL_COM2 || com1_fail_count >= 3) {
+	/* Fallback: switch protocols if current one fails 3+ times */
+	if (com1_fail_count >= 3 && current_protocol == PROTOCOL_COM1) {
+		upslogx(LOG_WARNING, "COM1 failed %d times, trying COM2", com1_fail_count);
+		current_protocol = PROTOCOL_COM2;
+		com1_fail_count = 0;
+		last_mode_switch = now;
+		
 		ser_set_speed(upsfd, device_path, B2400);
-		/* Allow serial port to settle after baud rate change */
 		{
 			struct timespec ts;
 			ts.tv_sec = 0;
@@ -954,22 +1027,40 @@ static int detect_protocol(void)
 		
 		if (ups_getinfo_com2()) {
 			com2_fail_count = 0;
-			if (current_protocol != PROTOCOL_COM2) {
-				current_protocol = PROTOCOL_COM2;
-				last_mode_switch = now;
-				upsdebugx(1, "Auto-detected protocol: COM2 (ASCII, 2400 baud)");
-			}
+			upslogx(LOG_INFO, "Successfully switched to COM2");
 			return 1;
-		} else {
-			com2_fail_count++;
 		}
+		com2_fail_count++;
 	}
 	
-	/* Fallback: reset fail counters after consecutive failures */
+	if (com2_fail_count >= 3 && current_protocol == PROTOCOL_COM2) {
+		upslogx(LOG_WARNING, "COM2 failed %d times, trying COM1", com2_fail_count);
+		current_protocol = PROTOCOL_COM1;
+		com2_fail_count = 0;
+		last_mode_switch = now;
+		
+		ser_set_speed(upsfd, device_path, B1200);
+		{
+			struct timespec ts;
+			ts.tv_sec = 0;
+			ts.tv_nsec = 100000000L;  /* 100ms */
+			nanosleep(&ts, NULL);
+		}
+		
+		if (ups_getinfo()) {
+			com1_fail_count = 0;
+			upslogx(LOG_INFO, "Successfully switched to COM1");
+			return 1;
+		}
+		com1_fail_count++;
+	}
+	
+	/* Both protocols failing - reset for retry */
 	if (com1_fail_count >= 3 && com2_fail_count >= 3) {
-		upsdebugx(1, "Both protocols failing, resetting fail counters");
+		upsdebugx(1, "Both protocols failing, resetting detection");
 		com1_fail_count = 0;
 		com2_fail_count = 0;
+		protocol_detected = 0;  /* Allow re-detection */
 		current_protocol = PROTOCOL_AUTO;
 	}
 	
@@ -1634,9 +1725,10 @@ void upsdrv_help(void)
 	printf("\n");
 	printf("COM2 Protocol Options (ASCII protocol at 2400 baud):\n");
 	printf(" protocol_mode: Protocol to use: 'auto', 'com1', 'com2' (default: 'auto')\n");
-	printf("                 auto: tries COM1 first, then COM2 if COM1 fails\n");
-	printf("                 com1: binary protocol at 1200 baud (original)\n");
-	printf("                 com2: ASCII protocol at 2400 baud (newer models)\n");
+	printf("                 auto: probes both protocols, prefers COM2 if UPS supports it\n");
+	printf("                       (COM2 has richer features: events, temperature, battery voltage)\n");
+	printf("                 com1: binary protocol at 1200 baud (older models)\n");
+	printf("                 com2: ASCII protocol at 2400 baud (newer models, IMP-525 etc.)\n");
 	printf("                NOTE: COM2 automatically alternates between Q1 and DQ1 commands\n");
 	printf("                      like the original Java driver (no configuration needed)\n");
 	printf(" event_hold:    Event latch time in seconds (default: 20, range: 1-300)\n");
