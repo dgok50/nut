@@ -15,6 +15,34 @@ root@openwrt:~$ ./powercom
 powercom: powercom: cannot execute binary file
 ```
 
+### Real-World Example / Реальный пример
+
+Here's **proof** of incompatibility using `file` command:
+
+**OpenWrt System Binary (WORKS) / Системный бинарник (РАБОТАЕТ):**
+```bash
+root@openwrt:~$ file /lib/nut/powercom
+/lib/nut/powercom: ELF 64-bit LSB executable, x86-64, 
+  dynamically linked, 
+  interpreter /lib/ld-musl-x86_64.so.1,     ← musl libc
+  no section header
+```
+
+**Fedora Binary (WON'T WORK) / Бинарник с Fedora (НЕ РАБОТАЕТ):**
+```bash
+root@openwrt:~$ file powercom
+powercom: ELF 64-bit LSB executable, x86-64, 
+  dynamically linked, 
+  interpreter /lib64/ld-linux-x86-64.so.2,  ← glibc
+  with debug_info, not stripped
+```
+
+**Critical Difference / Критическое различие:**
+- OpenWrt: `/lib/ld-musl-x86_64.so.1` (musl)
+- Fedora: `/lib64/ld-linux-x86-64.so.2` (glibc)
+
+These are **completely different** dynamic linkers! OpenWrt doesn't have glibc!
+
 ### Why This Happens / Почему это происходит
 
 OpenWrt uses **different libraries and compilation** than regular Linux distributions:
@@ -22,16 +50,40 @@ OpenWrt uses **different libraries and compilation** than regular Linux distribu
 | Feature | Fedora/Ubuntu | OpenWrt |
 |---------|---------------|---------|
 | C Library | glibc (GNU) | musl libc |
-| Size | Large | Minimal |
-| Dynamic libs | Many | Essential only |
+| Dynamic linker | `/lib64/ld-linux-x86-64.so.2` | `/lib/ld-musl-x86_64.so.1` |
+| Size | Large (~500KB) | Minimal (~150KB) |
+| Debug info | Included | Stripped |
+| Section header | Yes | No |
 | Optimization | Generic | Embedded-specific |
-| Linking | Standard | Static preferred |
 
 **Result / Результат:** Binaries are **incompatible** / Бинарники **несовместимы**
 
 ---
 
 ## Solutions / Решения
+
+### FIRST: Check if You Already Have It! / СНАЧАЛА: Проверьте, может уже есть!
+
+**IMPORTANT:** Before building, check if OpenWrt already has a working binary installed!
+
+```bash
+# Check if powercom driver exists / Проверить существование драйвера
+ls -la /lib/nut/powercom
+ls -la /usr/lib/nut/powercom
+
+# If found, verify it's an OpenWrt binary / Если найден, проверить что это OpenWrt бинарник
+file /lib/nut/powercom
+
+# Should show musl libc / Должно показать musl libc:
+# interpreter /lib/ld-musl-x86_64.so.1
+
+# Test it / Проверить работу
+/lib/nut/powercom -V
+/lib/nut/powercom -h
+```
+
+**If you see a working binary with musl libc, you're done! Use it!**  
+**Если видите рабочий бинарник с musl libc, всё готово! Используйте его!**
 
 ### Method 1: Use OpenWrt Package (EASIEST) / Использовать пакет OpenWrt (ПРОЩЕ ВСЕГО)
 
@@ -326,6 +378,55 @@ ldd /usr/lib/nut/powercom
 
 # Test with your UPS / Проверить с ИБП
 /usr/lib/nut/powercom -s test -x port=/dev/ttyUSB0 -d 1 -DDD
+```
+
+### How to Identify Binary Type / Как определить тип бинарника
+
+Use `file` command to check:
+
+```bash
+# Check binary / Проверить бинарник
+file powercom
+```
+
+**OpenWrt Binary (Correct) / Бинарник OpenWrt (Правильный):**
+```
+ELF 64-bit LSB executable, x86-64, 
+  dynamically linked, 
+  interpreter /lib/ld-musl-x86_64.so.1,  ← GOOD: musl
+  stripped                                ← GOOD: small size
+```
+
+**Fedora/Ubuntu Binary (Wrong) / Бинарник Fedora/Ubuntu (Неправильный):**
+```
+ELF 64-bit LSB executable, x86-64, 
+  dynamically linked, 
+  interpreter /lib64/ld-linux-x86-64.so.2,  ← BAD: glibc
+  with debug_info, not stripped              ← BAD: large size
+```
+
+**Key Indicators / Ключевые индикаторы:**
+
+✅ **OpenWrt binary:**
+- interpreter: `/lib/ld-musl-x86_64.so.1` or similar musl path
+- "stripped" or "no section header"
+- Small size (~150-300 KB)
+
+❌ **Fedora/Ubuntu binary:**
+- interpreter: `/lib64/ld-linux-x86-64.so.2` or similar glibc path
+- "with debug_info, not stripped"
+- Large size (~500 KB - 2 MB)
+
+### Quick Test / Быстрая проверка
+
+```bash
+# If this shows musl → good for OpenWrt
+# Если показывает musl → подходит для OpenWrt
+file powercom | grep musl
+
+# If this shows ld-linux or glibc → wrong, rebuild
+# Если показывает ld-linux или glibc → неправильно, пересобрать
+file powercom | grep -E "ld-linux|glibc"
 ```
 
 ---
