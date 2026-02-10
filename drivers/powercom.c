@@ -346,7 +346,7 @@ static int instcmd (const char *cmdname, const char *extra)
 			cmd_buf[0] = 'T';
 			cmd_buf[1] = '\r';
 			cmd_len = 2;
-			if (ser_send_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
 				return STAT_INSTCMD_HANDLED;
 			}
 			return STAT_INSTCMD_FAILED;
@@ -365,7 +365,7 @@ static int instcmd (const char *cmdname, const char *extra)
 			cmd_buf[1] = 'T';
 			cmd_buf[2] = '\r';
 			cmd_len = 3;
-			if (ser_send_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
 				return STAT_INSTCMD_HANDLED;
 			}
 			return STAT_INSTCMD_FAILED;
@@ -376,7 +376,7 @@ static int instcmd (const char *cmdname, const char *extra)
 			cmd_buf[0] = 'Q';
 			cmd_buf[1] = '\r';
 			cmd_len = 2;
-			if (ser_send_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
 				return STAT_INSTCMD_HANDLED;
 			}
 			return STAT_INSTCMD_FAILED;
@@ -388,7 +388,7 @@ static int instcmd (const char *cmdname, const char *extra)
 			cmd_buf[0] = 'Q';
 			cmd_buf[1] = '\r';
 			cmd_len = 2;
-			if (ser_send_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
 				upslogx(LOG_INFO, "Beeper toggled (current state will change)");
 				return STAT_INSTCMD_HANDLED;
 			}
@@ -409,7 +409,7 @@ static int instcmd (const char *cmdname, const char *extra)
 			cmd_buf[2] = '1';  /* 1 minute delay */
 			cmd_buf[3] = '\r';
 			cmd_len = 4;
-			if (ser_send_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
 				if (handling_upsdrv_shutdown > 0)
 					set_exit_flag(EF_EXIT_SUCCESS);
 				return STAT_INSTCMD_HANDLED;
@@ -608,7 +608,7 @@ static int ups_getinfo_com2(void)
 	}
 	
 	/* Send command with pacing */
-	ret = ser_send_pace(upsfd, 10, cmd_buf, cmd_len);
+	ret = ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len);
 	if (ret != cmd_len) {
 		upsdebugx(1, "COM2: Failed to send command (sent %" PRIiSIZE " of %d bytes)", ret, cmd_len);
 		return 0;
