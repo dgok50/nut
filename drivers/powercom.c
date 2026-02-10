@@ -611,9 +611,13 @@ static int ups_getinfo_com2(void)
 	}
 	
 	/* Send command with pacing - show hex dump at debug level 3 */
-	upsdebugx(3, "COM2: TX → [0x%02x 0x%02x 0x%02x 0x%02x] \"%s\"",
-	          cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3],
-	          (cmd == COM2_CMD_Q1) ? "Q1\\r" : "DQ1\\r");
+	if (cmd_len == 4) {
+		upsdebugx(3, "COM2: TX → [0x%02x 0x%02x 0x%02x 0x%02x] \"DQ1\\r\"",
+		          cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3]);
+	} else {
+		upsdebugx(3, "COM2: TX → [0x%02x 0x%02x 0x%02x] \"Q1\\r\"",
+		          cmd_buf[0], cmd_buf[1], cmd_buf[2]);
+	}
 	
 	ret = ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len);
 	if (ret != cmd_len) {
@@ -1164,13 +1168,23 @@ static float input_voltage(void)
 			}
 		}
 	} else if ( !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI")) {
+		/* IMP/OPTI: multiply by 2 (from ConCOM1Get.java line 663) */
 		tmp=raw_data[INPUT_VOLTAGE]*2.0;
 	} else {
 		tmp=linevoltage >= 220 ?
 			types[type].voltage[0] * raw_data[INPUT_VOLTAGE] + types[type].voltage[1] :
 			types[type].voltage[2] * raw_data[INPUT_VOLTAGE] + types[type].voltage[3];
 	}
-	if (tmp<0) tmp=0.0;
+	
+	/* Sanity checks from Java driver (ConCOM1Get.java lines 666-668) */
+	if (tmp < 0.0) {
+		tmp = 0.0;
+	}
+	if (tmp < 25.0) {
+		upsdebugx(3, "input.voltage: Very low value (%.1fV), possible power off", tmp);
+		tmp = 0.0;
+	}
+	
 	return tmp;
 }
 
@@ -1312,26 +1326,66 @@ static float output_voltage(void)
 
 static float input_freq(void)
 {
-	if ( !strcmp(types[type].name, "BNT") || !strcmp(types[type].name, "KIN"))
-		return 4807.0/raw_data[INPUT_FREQUENCY];
-	else if ( !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI"))
-		return raw_data[INPUT_FREQUENCY];
-	return raw_data[INPUT_FREQUENCY] ?
-		1.0 / (types[type].freq[0] *
-				raw_data[INPUT_FREQUENCY] +
-						types[type].freq[1]) : 0;
+	float tmp = 0.0;
+	
+	if ( !strcmp(types[type].name, "BNT") || !strcmp(types[type].name, "KIN")) {
+		/* BNT/KIN use formula: 4807 / raw_value (from ConCOM1Get.java line 694) */
+		if (raw_data[INPUT_FREQUENCY] != 0) {
+			tmp = 4807.0 / raw_data[INPUT_FREQUENCY];
+		} else {
+			tmp = 0.0;
+		}
+	} else if ( !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI")) {
+		/* IMP/OPTI use direct value (from ConCOM1Get.java line 700) */
+		tmp = raw_data[INPUT_FREQUENCY];
+	} else {
+		/* Other models use formula from type configuration */
+		tmp = raw_data[INPUT_FREQUENCY] ?
+			1.0 / (types[type].freq[0] * raw_data[INPUT_FREQUENCY] + types[type].freq[1]) : 0;
+	}
+	
+	/* Sanity check: Java code limits to 90 Hz and checks voltage (lines 652-705) */
+	if (tmp > 90.0) {
+		upsdebugx(3, "input.frequency: Invalid value %.1f Hz, setting to 0", tmp);
+		tmp = 0.0;
+	}
+	
+	/* When input voltage is too low, frequency should be zero (Java line 703-705) */
+	if (input_voltage() <= 20.0) {
+		upsdebugx(3, "input.frequency: Input voltage too low (%.1fV), setting to 0", input_voltage());
+		tmp = 0.0;
+	}
+	
+	return tmp;
 }
 
 static float output_freq(void)
 {
-	if ( !strcmp(types[type].name, "BNT") || !strcmp(types[type].name, "KIN"))
-		return 4807.0/raw_data[OUTPUT_FREQUENCY];
-	else if ( !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI"))
-		return raw_data[OUTPUT_FREQUENCY];
-	return raw_data[OUTPUT_FREQUENCY] ?
-		1.0 / (types[type].freq[0] *
-				raw_data[OUTPUT_FREQUENCY] +
-						types[type].freq[1]) : 0;
+	float tmp = 0.0;
+	
+	if ( !strcmp(types[type].name, "BNT") || !strcmp(types[type].name, "KIN")) {
+		/* BNT/KIN use formula: 4807 / raw_value (from ConCOM1Get.java line 646) */
+		if (raw_data[OUTPUT_FREQUENCY] != 0) {
+			tmp = 4807.0 / raw_data[OUTPUT_FREQUENCY];
+		} else {
+			tmp = 0.0;
+		}
+	} else if ( !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI")) {
+		/* IMP/OPTI use direct value (from ConCOM1Get.java line 648) */
+		tmp = raw_data[OUTPUT_FREQUENCY];
+	} else {
+		/* Other models use formula from type configuration */
+		tmp = raw_data[OUTPUT_FREQUENCY] ?
+			1.0 / (types[type].freq[0] * raw_data[OUTPUT_FREQUENCY] + types[type].freq[1]) : 0;
+	}
+	
+	/* Sanity check: Java code limits to 90 Hz (lines 652-654) */
+	if (tmp > 90.0) {
+		upsdebugx(3, "output.frequency: Invalid value %.1f Hz, setting to 0", tmp);
+		tmp = 0.0;
+	}
+	
+	return tmp;
 }
 
 static float load_level(void)
