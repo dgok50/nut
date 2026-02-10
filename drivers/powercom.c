@@ -86,6 +86,7 @@
 #include "nut_float.h"
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
 
 #define DRIVER_NAME	"PowerCom protocol UPS driver"
 #define DRIVER_VERSION	"0.27"
@@ -607,7 +608,11 @@ static int ups_getinfo_com2(void)
 		com2_iteration = 20;  /* Reset to 20, not 0, like Java driver */
 	}
 	
-	/* Send command with pacing */
+	/* Send command with pacing - show hex dump at debug level 3 */
+	upsdebugx(3, "COM2: TX → [0x%02x 0x%02x 0x%02x 0x%02x] \"%s\"",
+	          cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3],
+	          (cmd == COM2_CMD_Q1) ? "Q1\\r" : "DQ1\\r");
+	
 	ret = ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len);
 	if (ret != cmd_len) {
 		upsdebugx(1, "COM2: Failed to send command (sent %" PRIiSIZE " of %d bytes)", ret, cmd_len);
@@ -615,11 +620,30 @@ static int ups_getinfo_com2(void)
 	}
 	
 	/* Read response with 3 second timeout */
+	upsdebugx(3, "COM2: Waiting up to 3000ms for response...");
 	memset(response, 0, sizeof(response));
 	ret = ser_get_buf_len(upsfd, response, sizeof(response) - 1, 3, 0);
 	
+	/* Show what we received (or didn't) */
+	if (ret > 0) {
+		upsdebugx(3, "COM2: RX ← %" PRIiSIZE " bytes", ret);
+		/* Show first few bytes in hex for diagnostics */
+		if (ret >= 4) {
+			upsdebugx(3, "COM2: First bytes: [0x%02x 0x%02x 0x%02x 0x%02x ...] \"%c%c%c%c...\"",
+			          (unsigned char)response[0], (unsigned char)response[1], 
+			          (unsigned char)response[2], (unsigned char)response[3],
+			          isprint((unsigned char)response[0]) ? response[0] : '.',
+			          isprint((unsigned char)response[1]) ? response[1] : '.',
+			          isprint((unsigned char)response[2]) ? response[2] : '.',
+			          isprint((unsigned char)response[3]) ? response[3] : '.');
+		}
+	} else {
+		upsdebugx(3, "COM2: RX ← 0 bytes (timeout - UPS not responding)");
+	}
+	
 	if (ret < COM2_MIN_RESPONSE_LEN) {
-		upsdebugx(1, "COM2: Response too short (%" PRIiSIZE " bytes, expected >= %d)", ret, COM2_MIN_RESPONSE_LEN);
+		upsdebugx(1, "COM2: Response too short (%" PRIiSIZE " bytes, expected >= %d) - UPS silent or wrong protocol", 
+		          ret, COM2_MIN_RESPONSE_LEN);
 		return 0;
 	}
 	
