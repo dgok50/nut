@@ -591,14 +591,14 @@ static int ups_getinfo_com2(void)
 		cmd_buf[2] = '1';
 		cmd_buf[3] = '\r';
 		cmd_len = 4;
-		upsdebugx(3, "COM2: Sending DQ1 command (iteration %u)", com2_iteration);
+		upsdebugx(2, "COM2: Sending DQ1 command (iteration %u)", com2_iteration);
 	} else {
 		/* Odd iteration: Q1 command */
 		cmd_buf[0] = 'Q';
 		cmd_buf[1] = '1';
 		cmd_buf[2] = '\r';
 		cmd_len = 3;
-		upsdebugx(3, "COM2: Sending Q1 command (iteration %u)", com2_iteration);
+		upsdebugx(2, "COM2: Sending Q1 command (iteration %u)", com2_iteration);
 	}
 	
 	/* Increment iteration counter, reset at 1000 like Java driver */
@@ -610,7 +610,7 @@ static int ups_getinfo_com2(void)
 	/* Send command with pacing */
 	ret = ser_send_pace(upsfd, 10, cmd_buf, cmd_len);
 	if (ret != cmd_len) {
-		upsdebugx(2, "COM2: Failed to send command");
+		upsdebugx(1, "COM2: Failed to send command (sent %" PRIiSIZE " of %d bytes)", ret, cmd_len);
 		return 0;
 	}
 	
@@ -619,15 +619,15 @@ static int ups_getinfo_com2(void)
 	ret = ser_get_buf_len(upsfd, response, sizeof(response) - 1, 3, 0);
 	
 	if (ret < COM2_MIN_RESPONSE_LEN) {
-		upsdebugx(2, "COM2: Response too short (%" PRIiSIZE " bytes, expected >= %d)", ret, COM2_MIN_RESPONSE_LEN);
+		upsdebugx(1, "COM2: Response too short (%" PRIiSIZE " bytes, expected >= %d)", ret, COM2_MIN_RESPONSE_LEN);
 		return 0;
 	}
 	
-	upsdebugx(3, "COM2: Received %" PRIiSIZE " bytes: %s", ret, response);
+	upsdebugx(2, "COM2: Received %" PRIiSIZE " bytes: %s", ret, response);
 	
 	/* Validate response starts with '(' */
 	if (response[0] != '(') {
-		upsdebugx(2, "COM2: Response doesn't start with '('");
+		upsdebugx(1, "COM2: Response doesn't start with '(' (got 0x%02x)", response[0]);
 		return 0;
 	}
 	
@@ -958,6 +958,7 @@ static int detect_protocol(void)
 		upsdebugx(1, "First-time protocol detection: probing COM1 and COM2");
 		
 		/* Probe COM1 at 1200 baud */
+		upsdebugx(1, "Trying COM1 at 1200 baud (binary protocol)...");
 		ser_set_speed(upsfd, device_path, B1200);
 		{
 			struct timespec ts;
@@ -967,10 +968,13 @@ static int detect_protocol(void)
 		}
 		if (ups_getinfo()) {
 			com1_works = 1;
-			upsdebugx(1, "COM1 (1200 baud, binary) responds");
+			upsdebugx(1, "COM1 probe: SUCCESS - UPS responds to binary protocol");
+		} else {
+			upsdebugx(1, "COM1 probe: FAILED - no valid response");
 		}
 		
 		/* Probe COM2 at 2400 baud */
+		upsdebugx(1, "Trying COM2 at 2400 baud (ASCII protocol)...");
 		ser_set_speed(upsfd, device_path, B2400);
 		{
 			struct timespec ts;
@@ -980,7 +984,9 @@ static int detect_protocol(void)
 		}
 		if (ups_getinfo_com2()) {
 			com2_works = 1;
-			upsdebugx(1, "COM2 (2400 baud, ASCII) responds");
+			upsdebugx(1, "COM2 probe: SUCCESS - UPS responds to ASCII protocol");
+		} else {
+			upsdebugx(1, "COM2 probe: FAILED - no valid response");
 		}
 		
 		/* Prefer COM2 if both work (richer protocol, like Java driver preference) */
@@ -990,6 +996,7 @@ static int detect_protocol(void)
 			protocol_detected = 1;
 			last_mode_switch = now;
 			upslogx(LOG_INFO, "Auto-detected protocol: COM2 (ASCII, 2400 baud) - preferred");
+			upsdebugx(1, "Using COM2: richer features (battery voltage, temperature, events)");
 			return 1;
 		} else if (com1_works) {
 			current_protocol = PROTOCOL_COM1;
@@ -997,11 +1004,12 @@ static int detect_protocol(void)
 			protocol_detected = 1;
 			last_mode_switch = now;
 			upslogx(LOG_INFO, "Auto-detected protocol: COM1 (binary, 1200 baud) - fallback");
+			upsdebugx(1, "Using COM1: COM2 not available on this UPS");
 			return 1;
 		}
 		
 		/* Neither protocol works on first try */
-		upsdebugx(1, "No protocol responded on first detection attempt");
+		upsdebugx(1, "Protocol detection: Both COM1 and COM2 failed, will retry");
 		return 0;
 	}
 	
