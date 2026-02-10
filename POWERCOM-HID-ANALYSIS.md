@@ -75,6 +75,8 @@ HID:     App → usbhid-ups → powercom-hid.c → USB HID → UPS
 ### Команды (instcmd)
 - ✅ beeper.toggle/enable/disable
 - ✅ test.battery.start.quick
+- ✅ test.battery.start.deep (v0.75)
+- ✅ test.battery.stop (v0.75)
 - ✅ shutdown.return
 - ✅ shutdown.stayoff
 - ✅ load.on/load.off
@@ -89,8 +91,8 @@ HID:     App → usbhid-ups → powercom-hid.c → USB HID → UPS
 
 ### Варианты Тестов Батареи
 - ✅ Quick test (21,1) - Реализован
-- ❌ Deep test (21,2) - Не реализован
-- ❌ Cancel test (21,3) - Не реализован
+- ✅ Deep test (21,2) - **РЕАЛИЗОВАН** (v0.75)
+- ✅ Cancel test (21,3) - **РЕАЛИЗОВАН** (v0.75)
 
 ### Управление Розетками
 - ❌ Group 1 ON/OFF (49,1 / 49,0)
@@ -120,23 +122,24 @@ upsUsbDevice.syncSubmit(var);
 - Java: Любые байты можно отправить
 - NUT: Ограничено HID спецификацией
 
-## Что Можно Улучшить?
+## Что Было Улучшено
 
-### 1. Добавить Команды Тестов (ЛЕГКО)
+### 1. ✅ Добавлены Команды Тестов (v0.75)
 
 ```c
-// Добавить в powercom_hid2nut[] около строки 659:
+// Добавлено в powercom_hid2nut[] на строке 660-661:
 { "test.battery.start.deep", 0, 0, 
   "UPS.Battery.Test", NULL, "2", HU_TYPE_CMD, NULL },
 { "test.battery.stop", 0, 0, 
   "UPS.Battery.Test", NULL, "3", HU_TYPE_CMD, NULL },
 ```
 
-**Требует проверки:**
-- Поддерживает ли устройство значения 2 и 3?
-- Что возвращает HID дескриптор?
+**Реализовано:**
+- ✅ Deep battery test command (значение 2)
+- ✅ Cancel battery test command (значение 3)
+- ✅ Следует поведению Java USB драйвера (ConUSB3.java)
 
-### 2. Исследовать Управление Розетками (СЛОЖНО)
+### 2. Исследовать Управление Розетками (ТРЕБУЕТСЯ ЖЕЛЕЗО)
 
 **Проблема:** Нужны HID paths для розеток
 - В текущих маппингах нет
@@ -218,11 +221,11 @@ PowercomUPS.OutletControl
 | Load | ✅ 100% | ✅ 100% |
 | Temperature | ✅ COM2 only | ✅ Yes |
 | Beeper Control | ✅ Both | ✅ Yes |
-| Battery Test | ✅ Start/Stop | ⚠️ Start only |
+| Battery Test | ✅ Start/Stop | ✅ Quick/Deep/Stop (v0.75) |
 | Shutdown | ✅ Yes | ✅ Yes |
 | AVR Direction | ✅ Buck/Boost | ✅ Buck/Boost |
 | Event Detection | ✅ COM2 only | ✅ Via status |
-| Outlet Control | ❌ No | ❌ No (maybe HID) |
+| Outlet Control | ❌ No | ❌ No (needs HID path) |
 
 ## Вопрос к Пользователю
 
