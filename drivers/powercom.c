@@ -278,19 +278,21 @@ enum data {
 /* status bits */
 enum status {
 	SUMMARY       = 0U,
-	MAINS_FAILURE = 1U,
+	MAINS_FAILURE = 1U,   /* Byte 9, bit 0 - STATUS_A */
 	ONLINE        = 1U,
-	FAULT         = 1U,
-	LOW_BAT       = 2U,
+	FAULT         = 1U,   /* Byte 10, bit 0 - STATUS_B */
+	LOW_BAT       = 2U,   /* Byte 9, bit 1 - STATUS_A */
 	BAD_BAT       = 2U,
-	TEST          = 4U,
-	AVR_ON        = 8U,
-	AVR_MODE      = 16U,
+	BAD_BATTERY   = 2U,   /* Byte 10, bit 1 - STATUS_B - Battery failed/defective */
+	TEST          = 4U,   /* Byte 10, bit 2 - STATUS_B */
+	AVR_ON        = 8U,   /* Byte 9, bit 3 - STATUS_A */
+	BEEPER_STATUS = 8U,   /* Byte 10, bit 3 - STATUS_B - 0=ON, 1=OFF */
+	AVR_MODE      = 16U,  /* Byte 10, bit 4 - STATUS_B */
 	SD_COUNTER    = 16U,
-	OVERLOAD      = 32U,
+	OVERLOAD      = 32U,  /* Byte 9, bit 5 - STATUS_A */
 	SHED_COUNTER  = 32U,
 	DIS_NOLOAD    = 64U,
-	SD_DISPLAY    = 128U,
+	SD_DISPLAY    = 128U, /* Byte 10, bit 7 - STATUS_B */
 	OFF           = 128U
 };
 
@@ -1541,18 +1543,53 @@ void upsdrv_updateinfo(void)
 		status_set("OB");
 	}
 
-	if (raw_data[STATUS_A] & LOW_BAT)  status_set("LB");
-
-	if (raw_data[STATUS_A] & AVR_ON) {
-		input_voltage() < linevoltage ?
-			status_set("BOOST") : status_set("TRIM");
+	if (raw_data[STATUS_A] & LOW_BAT) {
+		status_set("LB");
+		upsdebugx(2, "STATUS: Low Battery");
 	}
 
-	if (raw_data[STATUS_A] & OVERLOAD)  status_set("OVER");
+	/* AVR with direction detection (from ConCOM1Get.java lines 336-364) */
+	if (raw_data[STATUS_A] & AVR_ON) {
+		int input_v = input_voltage();
+		int output_v = output_voltage();
+		if (input_v > output_v) {
+			status_set("TRIM");  /* Buck/Reduce voltage */
+			upsdebugx(2, "STATUS: AVR Buck (reducing voltage: %d→%d)", input_v, output_v);
+		} else if (output_v > input_v) {
+			status_set("BOOST");  /* Boost/Increase voltage */
+			upsdebugx(2, "STATUS: AVR Boost (increasing voltage: %d→%d)", input_v, output_v);
+		} else {
+			/* AVR active but voltages equal - rare but possible */
+			upsdebugx(2, "STATUS: AVR active (voltage regulation)");
+		}
+	}
 
-	if (raw_data[STATUS_B] & BAD_BAT)  status_set("RB");
+	if (raw_data[STATUS_A] & OVERLOAD) {
+		status_set("OVER");
+		upsdebugx(2, "STATUS: Overload");
+	}
 
-	if (raw_data[STATUS_B] & TEST)  status_set("TEST");
+	/* Battery failure detection (from ConCOM1Get.java lines 389-421) */
+	if (raw_data[STATUS_B] & BAD_BATTERY) {
+		status_set("RB");  /* Replace Battery */
+		dstate_setinfo("ups.alarm", "Battery failed - needs replacement");
+		upsdebugx(2, "STATUS: Battery FAILED (needs replacement)");
+	}
+
+	if (raw_data[STATUS_B] & TEST) {
+		status_set("TEST");
+		upsdebugx(2, "STATUS: Battery test in progress");
+	}
+
+	/* Parse beeper status (from ConCOM1Get.java lines 495-499) */
+	/* Note: Inverted logic - bit 0=ON, 1=OFF */
+	if (raw_data[STATUS_B] & BEEPER_STATUS) {
+		dstate_setinfo("ups.beeper.status", "disabled");
+		upsdebugx(3, "Beeper: disabled");
+	} else {
+		dstate_setinfo("ups.beeper.status", "enabled");
+		upsdebugx(3, "Beeper: enabled");
+	}
 
 	status_commit();
 
