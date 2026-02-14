@@ -131,6 +131,7 @@ static int allow_control = 0;  /* allow dangerous commands */
 static time_t last_mode_switch = 0;
 static int com1_fail_count = 0;
 static int com2_fail_count = 0;
+static speed_t current_speed = 0;  /* Track current baud rate to avoid redundant ser_set_speed calls */
 
 
 /* forward declaration of functions used to setup flow control */
@@ -540,23 +541,54 @@ static int parse_com2_status(const char *status_str, unsigned char *bits)
 {
 	size_t len;
 	int i;
+	char clean_str[16];
+	const char *p = status_str;
 	
 	/* Ensure string is null-terminated and has valid length */
 	if (!status_str) {
 		return 0;
 	}
 	
-	len = strnlen(status_str, 16);  /* Check up to 16 chars max */
+	/* Copy status string, removing trailing \r, \n, ) characters */
+	len = 0;
+	while (*p && len < 15 && *p != '\r' && *p != '\n' && *p != ')') {
+		clean_str[len++] = *p++;
+	}
+	clean_str[len] = '\0';
+	
+	/* Status string must be exactly 8 characters */
 	if (len != 8) {
+		upsdebugx(2, "COM2: Invalid status length %zu (expected 8): '%s'", len, clean_str);
 		return 0;
 	}
 	
+	/* Parse each bit with strict validation:
+	 * - Bits b0,b1,b2,b4,b5,b6,b7 (indices 7,6,5,3,2,1,0) must be binary '0' or '1'
+	 * - Bit b3 (index 4) can be '0'..'3' (represents state nibble)
+	 */
 	for (i = 0; i < 8; i++) {
-		if (status_str[i] < '0' || status_str[i] > '3') {
-			return 0;
+		if (i == 4) {
+			/* b3 (index 4): Allow 0..3 for state nibble */
+			if (clean_str[i] < '0' || clean_str[i] > '3') {
+				upsdebugx(2, "COM2: Invalid b3 value '%c' at position %d (expected 0-3)", 
+				          clean_str[i], i);
+				return 0;
+			}
+		} else {
+			/* All other bits: Only allow binary 0/1 */
+			if (clean_str[i] != '0' && clean_str[i] != '1') {
+				upsdebugx(2, "COM2: Invalid bit value '%c' at position %d (expected 0 or 1)", 
+				          clean_str[i], i);
+				return 0;
+			}
 		}
-		bits[i] = status_str[i] - '0';
+		bits[i] = clean_str[i] - '0';
 	}
+	
+	upsdebugx(3, "COM2: Status parsed: '%s' → bits[b7..b0]=%d%d%d%d%d%d%d%d",
+	          clean_str,
+	          bits[0], bits[1], bits[2], bits[3], bits[4], bits[5], bits[6], bits[7]);
+	
 	return 1;
 }
 
@@ -565,6 +597,36 @@ static int parse_com2_status(const char *status_str, unsigned char *bits)
  * Minimum example: "(100 200 10 50.0 100 25 00000000" = 46 bytes
  */
 #define COM2_MIN_RESPONSE_LEN 46
+
+/* Helper: Set serial speed only if it differs from current speed
+ * Reduces overhead by avoiding redundant ser_set_speed calls
+ * Returns 1 on success, 0 on failure
+ */
+static int set_speed_if_needed(speed_t new_speed)
+{
+	if (current_speed == new_speed) {
+		upsdebugx(3, "Speed already set to %d, skipping ser_set_speed", (int)new_speed);
+		return 1;
+	}
+	
+	upsdebugx(2, "Setting serial speed to %d baud", (int)new_speed);
+	if (ser_set_speed(upsfd, device_path, new_speed) == -1) {
+		upsdebugx(1, "Failed to set serial speed to %d", (int)new_speed);
+		return 0;
+	}
+	
+	current_speed = new_speed;
+	
+	/* Small delay only on actual speed change (10ms, not 100ms) */
+	{
+		struct timespec ts;
+		ts.tv_sec = 0;
+		ts.tv_nsec = 10000000L;  /* 10ms - reduced from 100ms */
+		nanosleep(&ts, NULL);
+	}
+	
+	return 1;
+}
 
 /* COM2: Send command and read ASCII response
  * Command: Q1 or DQ1 followed by \r
@@ -604,10 +666,10 @@ static int ups_getinfo_com2(void)
 		upsdebugx(2, "COM2: Sending Q1 command (iteration %u)", com2_iteration);
 	}
 	
-	/* Increment iteration counter, reset at 1000 like Java driver */
+	/* Increment iteration counter, reset at 1000 to prevent overflow */
 	com2_iteration++;
 	if (com2_iteration >= 1000) {
-		com2_iteration = 20;  /* Reset to 20, not 0, like Java driver */
+		com2_iteration = 0;  /* Reset to 0 for predictable behavior */
 	}
 	
 	/* Send command with pacing - show hex dump at debug level 3 */
@@ -619,20 +681,24 @@ static int ups_getinfo_com2(void)
 		          cmd_buf[0], cmd_buf[1], cmd_buf[2]);
 	}
 	
+	/* Flush input buffer before sending command to prevent stale data */
+	ser_flush_in(upsfd, "", 0);
+	
 	ret = ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len);
 	if (ret != cmd_len) {
 		upsdebugx(1, "COM2: Failed to send command (sent %" PRIiSIZE " of %d bytes)", ret, cmd_len);
 		return 0;
 	}
 	
-	/* Read response with 3 second timeout */
-	upsdebugx(3, "COM2: Waiting up to 3000ms for response...");
+	/* Read response line until \r with 500ms timeout
+	 * ser_get_line reads until endchar (\r), preventing fragmentation and reducing lag */
+	upsdebugx(3, "COM2: Reading response (waiting for \\r, timeout 500ms)...");
 	memset(response, 0, sizeof(response));
-	ret = ser_get_buf_len(upsfd, response, sizeof(response) - 1, 3, 0);
+	ret = ser_get_line(upsfd, response, sizeof(response) - 1, '\r', "", 0, 500000);
 	
 	/* Show what we received (or didn't) */
 	if (ret > 0) {
-		upsdebugx(3, "COM2: RX ← %" PRIiSIZE " bytes", ret);
+		upsdebugx(3, "COM2: RX ← %" PRIiSIZE " bytes (terminated at \\r)", ret);
 		/* Show first few bytes in hex for diagnostics */
 		if (ret >= 4) {
 			upsdebugx(3, "COM2: First bytes: [0x%02x 0x%02x 0x%02x 0x%02x ...] \"%c%c%c%c...\"",
@@ -644,7 +710,7 @@ static int ups_getinfo_com2(void)
 			          isprint((unsigned char)response[3]) ? response[3] : '.');
 		}
 	} else {
-		upsdebugx(3, "COM2: RX ← 0 bytes (timeout - UPS not responding)");
+		upsdebugx(3, "COM2: RX ← 0 bytes (timeout or UPS not responding)");
 	}
 	
 	if (ret < COM2_MIN_RESPONSE_LEN) {
@@ -674,45 +740,55 @@ static int ups_getinfo_com2(void)
 	/* Field 0: Input Voltage (skip '(' prefix) */
 	com2_current.input_voltage = strtod(token + 1, NULL);
 	field_count++;
+	upsdebugx(3, "COM2: Field %d (Input V): %s → %.1f", field_count - 1, token, com2_current.input_voltage);
 	
-	/* Field 1: Output Voltage - not used, field 2 has correct value */
+	/* Field 1: Fault Voltage or Second Output Voltage reading 
+	 * Some Q1 implementations include I/P fault voltage here.
+	 * Currently not used - investigate with real hardware if needed. */
 	token = strtok_r(NULL, " ", &saveptr);
 	if (!token) goto parse_error;
 	field_count++;
+	upsdebugx(3, "COM2: Field %d (Fault V / not used): %s", field_count - 1, token);
 	
-	/* Field 2: Output Voltage (actual) */
+	/* Field 2: Output Voltage (actual/primary reading) */
 	token = strtok_r(NULL, " ", &saveptr);
 	if (!token) goto parse_error;
 	com2_current.output_voltage = strtod(token, NULL);
 	field_count++;
+	upsdebugx(3, "COM2: Field %d (Output V): %s → %.1f", field_count - 1, token, com2_current.output_voltage);
 	
 	/* Field 3: Load % */
 	token = strtok_r(NULL, " ", &saveptr);
 	if (!token) goto parse_error;
 	com2_current.load = strtod(token, NULL);
 	field_count++;
+	upsdebugx(3, "COM2: Field %d (Load %%): %s → %.1f", field_count - 1, token, com2_current.load);
 	
 	/* Field 4: Frequency */
 	token = strtok_r(NULL, " ", &saveptr);
 	if (!token) goto parse_error;
 	com2_current.frequency = strtod(token, NULL);
 	field_count++;
+	upsdebugx(3, "COM2: Field %d (Frequency): %s → %.1f", field_count - 1, token, com2_current.frequency);
 	
 	/* Field 5: Battery level or voltage */
 	token = strtok_r(NULL, " ", &saveptr);
 	if (!token) goto parse_error;
 	com2_current.battery_level = strtod(token, NULL);
 	field_count++;
+	upsdebugx(3, "COM2: Field %d (Battery): %s → %.1f", field_count - 1, token, com2_current.battery_level);
 	
 	/* Field 6: Temperature */
 	token = strtok_r(NULL, " ", &saveptr);
 	if (!token) goto parse_error;
 	com2_current.temperature = strtod(token, NULL);
 	field_count++;
+	upsdebugx(3, "COM2: Field %d (Temperature): %s → %.1f", field_count - 1, token, com2_current.temperature);
 	
 	/* Field 7: Status bits (8 characters) */
 	token = strtok_r(NULL, " ", &saveptr);
 	if (!token) goto parse_error;
+	upsdebugx(3, "COM2: Field %d (Status): '%s'", field_count, token);
 	if (!parse_com2_status(token, com2_current.status_bits)) {
 		upsdebugx(2, "COM2: Invalid status field");
 		return 0;
@@ -720,8 +796,11 @@ static int ups_getinfo_com2(void)
 	field_count++;
 	
 	if (field_count < 8) {
+		upsdebugx(2, "COM2: Insufficient fields (got %d, expected 8)", field_count);
 		goto parse_error;
 	}
+	
+	upsdebugx(3, "COM2: Successfully parsed %d fields", field_count);
 	
 	com2_current.last_valid = time(NULL);
 	
@@ -852,39 +931,22 @@ static void com2_update_vars(void)
 		dstate_setinfo("battery.charge", "%.1f", com2_current.battery_level);
 	}
 	
-	/* Estimate battery runtime based on charge and load */
-	if (com2_current.battery_level > 50 && com2_current.load > 0) {
-		/* Simple runtime estimation: assume 30 min at 100% load, scale by charge and load */
-		/* Runtime = (charge/100) * (base_runtime) * (100/load) */
-		float base_runtime_minutes = 30.0; /* Typical for small UPS at full load */
-		float estimated_runtime = (com2_current.battery_level / 100.0) * base_runtime_minutes * (100.0 / com2_current.load);
-		
-		/* Cap at reasonable maximum (10 hours = 600 minutes) */
-		if (estimated_runtime > 600.0) {
-			estimated_runtime = 600.0;
-		}
-		
-		/* Convert to seconds and set */
-		dstate_setinfo("battery.runtime", "%.0f", estimated_runtime * 60.0);
-		
-		/* Set low runtime threshold at 5 minutes (300 seconds) */
-		dstate_setinfo("battery.runtime.low", "300");
-	}
-	
-	/* Temperature */
-	if (com2_current.temperature > 0.0) {
+	/* Temperature - validate range instead of just checking > 0 */
+	if (com2_current.temperature >= -20.0 && com2_current.temperature <= 100.0) {
 		dstate_setinfo("ups.temperature", "%.1f", com2_current.temperature);
 	}
 	
-	/* Status processing */
+	/* Status processing 
+	 * Bit mapping: status_bits[0]=b7, [1]=b6, [2]=b5, [3]=b4, [4]=b3, [5]=b2, [6]=b1, [7]=b0
+	 */
 	status_init();
 	alarm_init();
 	
-	/* b7: Power failure */
+	/* b7 (status_bits[0]): Power failure */
 	if (com2_current.status_bits[0] == 1) {
 		status_set("OB");  /* On battery */
 	} else {
-		/* b1: UPS output OFF */
+		/* b1 (status_bits[6]): UPS output OFF */
 		if (com2_current.status_bits[6] == 1) {
 			status_set("OFF");
 		} else {
@@ -892,49 +954,45 @@ static void com2_update_vars(void)
 		}
 	}
 	
-	/* b6: Battery low */
+	/* b6 (status_bits[1]): Battery low */
 	if (com2_current.status_bits[1] == 1) {
 		status_set("LB");
 	}
 	
-	/* b5: Bypass/AVR active */
+	/* b5 (status_bits[2]): AVR active (Buck/Boost regulation) */
 	if (com2_current.status_bits[2] == 1) {
-		/* Check if online or offline for AVR vs Bypass */
-		if (com2_current.status_bits[3] == 0) {
-			/* Online: Bypass mode */
-			status_set("BYPASS");
-			alarm_set("voltage not regulated");
-		} else {
-			/* Offline: AVR mode */
-			if (com2_current.input_voltage > com2_current.output_voltage) {
-				status_set("TRIM");
-			} else {
-				status_set("BOOST");
-			}
+		/* Determine AVR direction: Buck (reduce) vs Boost (increase) */
+		if (com2_current.input_voltage > com2_current.output_voltage) {
+			status_set("TRIM");  /* Buck/Reduce voltage */
+		} else if (com2_current.output_voltage > com2_current.input_voltage) {
+			status_set("BOOST");  /* Boost/Increase voltage */
 		}
+		/* Note: Removed inappropriate BYPASS status - this is line-interactive UPS */
 	}
 	
-	/* b4: UPS fault (status_bits[3] represents b4) */
+	/* b4 (status_bits[3]): UPS fault */
 	if (com2_current.status_bits[3] == 1) {
 		alarm_set("UPS fault");
 	}
 	
-	/* b3: Online/Offline/Battery fault status (status_bits[4] represents b3)
+	/* b3 (status_bits[4]): Online/Offline/Battery fault status (multi-value: 0-3)
 	 * Values: 0=Online, 1=Offline, 2/3=Battery fault
 	 */
 	if (com2_current.status_bits[4] >= 2) {
 		status_set("RB");  /* Replace battery */
+		alarm_set("Battery failed - needs replacement");
 	}
 	
-	/* b2: Self-test running */
+	/* b2 (status_bits[5]): Self-test running */
 	if (com2_current.status_bits[5] == 1) {
 		status_set("TEST");
 		dstate_setinfo("ups.test.status", "in_progress");
 	} else {
-		dstate_setinfo("ups.test.status", "done");
+		/* Only set status when test is not running - don't report "done" constantly */
+		dstate_delinfo("ups.test.status");
 	}
 	
-	/* b0: Beeper status */
+	/* b0 (status_bits[7]): Beeper status */
 	if (com2_current.status_bits[7] == 1) {
 		dstate_setinfo("ups.beeper.status", "disabled");
 	} else {
@@ -977,6 +1035,14 @@ static int detect_protocol(void)
 		current_protocol = configured_protocol;
 		last_mode_switch = now;
 		upsdebugx(1, "Using configured protocol: COM%d", current_protocol);
+		
+		/* Set speed once for configured protocol */
+		if (current_protocol == PROTOCOL_COM1) {
+			set_speed_if_needed(B1200);
+		} else if (current_protocol == PROTOCOL_COM2) {
+			set_speed_if_needed(B2400);
+		}
+		
 		return 1;
 	}
 	
@@ -989,13 +1055,7 @@ static int detect_protocol(void)
 		
 		/* Probe COM1 at 1200 baud */
 		upsdebugx(1, "Trying COM1 at 1200 baud (binary protocol)...");
-		ser_set_speed(upsfd, device_path, B1200);
-		{
-			struct timespec ts;
-			ts.tv_sec = 0;
-			ts.tv_nsec = 100000000L;  /* 100ms */
-			nanosleep(&ts, NULL);
-		}
+		set_speed_if_needed(B1200);
 		if (ups_getinfo()) {
 			com1_works = 1;
 			upsdebugx(1, "COM1 probe: SUCCESS - UPS responds to binary protocol");
@@ -1005,13 +1065,7 @@ static int detect_protocol(void)
 		
 		/* Probe COM2 at 2400 baud */
 		upsdebugx(1, "Trying COM2 at 2400 baud (ASCII protocol)...");
-		ser_set_speed(upsfd, device_path, B2400);
-		{
-			struct timespec ts;
-			ts.tv_sec = 0;
-			ts.tv_nsec = 100000000L;  /* 100ms */
-			nanosleep(&ts, NULL);
-		}
+		set_speed_if_needed(B2400);
 		if (ups_getinfo_com2()) {
 			com2_works = 1;
 			upsdebugx(1, "COM2 probe: SUCCESS - UPS responds to ASCII protocol");
@@ -1022,7 +1076,7 @@ static int detect_protocol(void)
 		/* Prefer COM2 if both work (richer protocol, like Java driver preference) */
 		if (com2_works) {
 			current_protocol = PROTOCOL_COM2;
-			ser_set_speed(upsfd, device_path, B2400);
+			set_speed_if_needed(B2400);
 			protocol_detected = 1;
 			last_mode_switch = now;
 			upslogx(LOG_INFO, "Auto-detected protocol: COM2 (ASCII, 2400 baud) - preferred");
@@ -1030,7 +1084,7 @@ static int detect_protocol(void)
 			return 1;
 		} else if (com1_works) {
 			current_protocol = PROTOCOL_COM1;
-			ser_set_speed(upsfd, device_path, B1200);
+			set_speed_if_needed(B1200);
 			protocol_detected = 1;
 			last_mode_switch = now;
 			upslogx(LOG_INFO, "Auto-detected protocol: COM1 (binary, 1200 baud) - fallback");
@@ -1043,17 +1097,10 @@ static int detect_protocol(void)
 		return 0;
 	}
 	
-	/* After initial detection, stick with detected protocol unless it fails */
+	/* After initial detection, light healthcheck without redundant speed changes */
 	if (protocol_detected) {
 		if (current_protocol == PROTOCOL_COM1) {
-			ser_set_speed(upsfd, device_path, B1200);
-			{
-				struct timespec ts;
-				ts.tv_sec = 0;
-				ts.tv_nsec = 100000000L;  /* 100ms */
-				nanosleep(&ts, NULL);
-			}
-			
+			/* Speed already set during detection - just verify communication */
 			if (ups_getinfo()) {
 				com1_fail_count = 0;
 				return 1;
@@ -1062,14 +1109,7 @@ static int detect_protocol(void)
 				upsdebugx(2, "COM1 failed (count: %d)", com1_fail_count);
 			}
 		} else if (current_protocol == PROTOCOL_COM2) {
-			ser_set_speed(upsfd, device_path, B2400);
-			{
-				struct timespec ts;
-				ts.tv_sec = 0;
-				ts.tv_nsec = 100000000L;  /* 100ms */
-				nanosleep(&ts, NULL);
-			}
-			
+			/* Speed already set during detection - just verify communication */
 			if (ups_getinfo_com2()) {
 				com2_fail_count = 0;
 				return 1;
@@ -1087,13 +1127,7 @@ static int detect_protocol(void)
 		com1_fail_count = 0;
 		last_mode_switch = now;
 		
-		ser_set_speed(upsfd, device_path, B2400);
-		{
-			struct timespec ts;
-			ts.tv_sec = 0;
-			ts.tv_nsec = 100000000L;  /* 100ms */
-			nanosleep(&ts, NULL);
-		}
+		set_speed_if_needed(B2400);
 		
 		if (ups_getinfo_com2()) {
 			com2_fail_count = 0;
@@ -1109,13 +1143,7 @@ static int detect_protocol(void)
 		com2_fail_count = 0;
 		last_mode_switch = now;
 		
-		ser_set_speed(upsfd, device_path, B1200);
-		{
-			struct timespec ts;
-			ts.tv_sec = 0;
-			ts.tv_nsec = 100000000L;  /* 100ms */
-			nanosleep(&ts, NULL);
-		}
+		set_speed_if_needed(B1200);
 		
 		if (ups_getinfo()) {
 			com1_fail_count = 0;
@@ -2129,16 +2157,24 @@ void upsdrv_initinfo(void)
 	dstate_addcmd ("shutdown.return");
 	dstate_addcmd ("shutdown.stayoff");
 	
-	/* Add COM2-specific commands if protocol supports them */
-	if (configured_protocol == PROTOCOL_COM2 || configured_protocol == PROTOCOL_AUTO) {
+	/* Add COM2-specific commands ONLY if actually using COM2 protocol
+	 * Note: Commands are added after protocol detection in upsdrv_initinfo(),
+	 * so current_protocol reflects the actual detected/configured protocol.
+	 */
+	if (current_protocol == PROTOCOL_COM2) {
 		dstate_addcmd ("test.battery.stop");
 		dstate_addcmd ("beeper.toggle");
 		dstate_addcmd ("beeper.enable");
 		dstate_addcmd ("beeper.disable");
+		upsdebugx(1, "Added COM2-specific commands (test.battery.stop, beeper.*)");
 		if (allow_control) {
 			dstate_addcmd ("shutdown.stayoff.dangerous");
 			upslogx(LOG_WARNING, "Dangerous shutdown commands enabled");
 		}
+	} else if (current_protocol == PROTOCOL_COM1) {
+		/* COM1 has beeper toggle via byte 0x05 */
+		dstate_addcmd ("beeper.toggle");
+		upsdebugx(1, "Added COM1 beeper.toggle command (byte 0x05)");
 	}
 	
 	upsh.instcmd = instcmd;
