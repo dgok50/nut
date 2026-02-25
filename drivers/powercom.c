@@ -1673,35 +1673,39 @@ void upsdrv_updateinfo(void)
 		upsdebugx(3, "Beeper: enabled");
 	}
 
-	/* Detect battery charging to prevent dstate.c from incorrectly inferring DISCHRG
-	 * when battery charge fluctuates slightly while online.
+	/* Prevent dstate.c from incorrectly inferring DISCHRG when online.
 	 * 
-	 * Issue: Battery charge naturally varies (89% -> 92% -> 89%), and dstate.c
-	 * (lines 1903-1915) would infer DISCHRG even when UPS is online, which is wrong.
+	 * Issue: Battery charge naturally fluctuates (89% -> 92% -> 89%), and dstate.c
+	 * (lines 1903-1915) will infer DISCHRG whenever charge drops, even when UPS
+	 * is online. This is wrong - battery can't discharge when on mains!
 	 * 
-	 * Solution: Explicitly set CHRG when charge increases significantly (>0.5%)
-	 * while online. Never set DISCHRG when online.
+	 * Previous attempt: Only set CHRG when charge increased >0.5%
+	 * Problem: When charge dropped, driver set nothing, dstate.c inferred DISCHRG
+	 * 
+	 * Correct solution: Always set CHRG when online and battery < 100%. This
+	 * prevents dstate.c from ever inferring DISCHRG when online.
+	 * 
+	 * Rationale: When UPS is online with battery <100%, it's in charging/float
+	 * mode (either actively charging or maintaining charge). It's accurate to
+	 * show CHRG in both cases.
 	 * 
 	 * When online, battery status should be:
-	 * - CHRG (actively charging) when charge increasing
-	 * - Nothing (float/idle) when charge stable
+	 * - CHRG when battery < 100% (charging or float mode)
+	 * - Nothing when battery = 100% (fully charged)
 	 * - Never DISCHRG (that's only for OB - on battery)
 	 */
 	if (!(raw_data[STATUS_A] & MAINS_FAILURE)) {
-		/* Online (not on battery) - track charging */
-		static double prev_charge = -1.0;
+		/* Online (not on battery) */
 		double curr_charge = batt_level();
 		
-		if (prev_charge >= 0.0 && curr_charge > prev_charge + 0.5) {
-			/* Charge increasing significantly (>0.5%) -> charging */
+		if (curr_charge < 99.5) {
+			/* Battery not full -> UPS is charging/maintaining */
 			status_set("CHRG");
-			upsdebugx(3, "Battery: charging (%.1f%% -> %.1f%%)", prev_charge, curr_charge);
+			upsdebugx(3, "Battery: maintaining/charging (%.1f%%)", curr_charge);
 		}
-		/* Never set DISCHRG when online - that would be wrong!
-		 * dstate.c should not infer DISCHRG from minor charge fluctuations.
+		/* When battery full (>=99.5%), don't set CHRG.
+		 * Never set DISCHRG when online - that would be wrong!
 		 */
-		
-		prev_charge = curr_charge;
 	}
 
 	status_commit();
