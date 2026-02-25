@@ -1690,7 +1690,7 @@ void upsdrv_updateinfo(void)
 	if (!(raw_data[STATUS_A] & MAINS_FAILURE)) {
 		/* Online (not on battery) - track charging */
 		static double prev_charge = -1.0;
-		double curr_charge = battery_charge();
+		double curr_charge = batt_level();
 		
 		if (prev_charge >= 0.0 && curr_charge > prev_charge + 0.5) {
 			/* Charge increasing significantly (>0.5%) -> charging */
