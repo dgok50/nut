@@ -89,7 +89,7 @@
 #include <ctype.h>
 
 #define DRIVER_NAME	"PowerCom protocol UPS driver"
-#define DRIVER_VERSION	"0.28"
+#define DRIVER_VERSION	"0.29"
 
 /* driver description structure */
 upsdrv_info_t	upsdrv_info = {
@@ -137,6 +137,10 @@ static speed_t current_speed = 0;  /* Track current baud rate to avoid redundant
 /* forward declaration of functions used to setup flow control */
 static void dtr0rts1 (void);
 static void no_flow_control (void);
+
+/* forward declarations of COM2 protocol query functions */
+static int ups_com2_get_runtime(void);
+static int ups_com2_get_power(void);
 
 /* struct defining types
  * ---------------------
@@ -362,6 +366,20 @@ static int instcmd (const char *cmdname, const char *extra)
 	
 	/* COM2-specific commands */
 	if (current_protocol == PROTOCOL_COM2) {
+		if (!strcasecmp(cmdname, "test.battery.start.deep")) {
+			upslog_INSTCMD_POWERSTATE_MAYBE(cmdname, extra);
+			/* COM2: TL command (deep/long battery test)
+			 * From Java ConCOM2Set.java: a==2 sends {84,76,13} = "TL\r" */
+			cmd_buf[0] = 'T';
+			cmd_buf[1] = 'L';
+			cmd_buf[2] = '\r';
+			cmd_len = 3;
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		}
+
 		if (!strcasecmp(cmdname, "test.battery.stop")) {
 			upslog_INSTCMD_POWERSTATE_MAYBE(cmdname, extra);
 			/* COM2: CT command */
@@ -398,7 +416,52 @@ static int instcmd (const char *cmdname, const char *extra)
 			}
 			return STAT_INSTCMD_FAILED;
 		}
-		
+
+		/* Outlet group commands
+		 * From Java ConCOM2Set.java: a==6..9 controls outlet groups
+		 * O01ON\r / O01OFF\r / O02ON\r / O02OFF\r */
+		if (!strcasecmp(cmdname, "outlet.1.load.on")) {
+			cmd_buf[0] = 'O'; cmd_buf[1] = '0'; cmd_buf[2] = '1';
+			cmd_buf[3] = 'O'; cmd_buf[4] = 'N'; cmd_buf[5] = '\r';
+			cmd_len = 6;
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		}
+
+		if (!strcasecmp(cmdname, "outlet.1.load.off")) {
+			cmd_buf[0] = 'O'; cmd_buf[1] = '0'; cmd_buf[2] = '1';
+			cmd_buf[3] = 'O'; cmd_buf[4] = 'F'; cmd_buf[5] = 'F';
+			cmd_buf[6] = '\r';
+			cmd_len = 7;
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		}
+
+		if (!strcasecmp(cmdname, "outlet.2.load.on")) {
+			cmd_buf[0] = 'O'; cmd_buf[1] = '0'; cmd_buf[2] = '2';
+			cmd_buf[3] = 'O'; cmd_buf[4] = 'N'; cmd_buf[5] = '\r';
+			cmd_len = 6;
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		}
+
+		if (!strcasecmp(cmdname, "outlet.2.load.off")) {
+			cmd_buf[0] = 'O'; cmd_buf[1] = '0'; cmd_buf[2] = '2';
+			cmd_buf[3] = 'O'; cmd_buf[4] = 'F'; cmd_buf[5] = 'F';
+			cmd_buf[6] = '\r';
+			cmd_len = 7;
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		}
+
 		/* Dangerous commands - require allow_control=yes */
 		if (!strcasecmp(cmdname, "shutdown.stayoff.dangerous")) {
 			if (!allow_control) {
@@ -629,7 +692,7 @@ static int set_speed_if_needed(speed_t new_speed)
 }
 
 /* COM2: Send command and read ASCII response
- * Command: Q1 or DQ1 followed by \r
+ * Command: Q1 or DQ1 followed by \r (or periodically Rt/Yop)
  * Response format: (InputV OutputV Load Freq BattLevel Temp Status
  * Returns 1 on success, 0 on failure
  */
@@ -643,7 +706,32 @@ static int ups_getinfo_com2(void)
 	char *saveptr = NULL;
 	int field_count = 0;
 	char response_copy[128];
-	
+
+	/* Increment iteration counter, reset at 1000 to prevent overflow
+	 * Starts at 5 after upsdrv_initinfo() sets com2_iteration=5 (after I/F init commands)
+	 * After overflow (>=1000), reset to 20 to skip the startup-phase iteration range
+	 * Mirrors Java ConCOM2Set.java: roopINT starts at 1, resets from 1000 to 20 */
+	com2_iteration++;
+	if (com2_iteration >= 1000) {
+		com2_iteration = 20;  /* Reset past startup range (1-19), matching Java reset to 20 */
+	}
+
+	/* Periodically send Rt (runtime) command: every 10 iterations
+	 * From Java ConCOM2Set.java: roopINT % 10 == 0 → write(Rt) */
+	if (com2_iteration % 10 == 0) {
+		upsdebugx(2, "COM2: Sending Rt command (iteration %u)", com2_iteration);
+		ups_com2_get_runtime();
+		return 1;  /* Skip normal Q1/DQ1 this iteration */
+	}
+
+	/* Periodically send Yop (output power) command: every 15 iterations
+	 * From Java ConCOM2Set.java: roopINT % 15 == 0 → write(Yop) */
+	if (com2_iteration % 15 == 0) {
+		upsdebugx(2, "COM2: Sending Yop command (iteration %u)", com2_iteration);
+		ups_com2_get_power();
+		return 1;  /* Skip normal Q1/DQ1 this iteration */
+	}
+
 	/* Alternate between DQ1 (even) and Q1 (odd) like the original Java driver
 	 * ConCOM2Set.java lines 186-194:
 	 *   if (roopINT % 2 == 0) { write(a1); }  // DQ1
@@ -664,21 +752,6 @@ static int ups_getinfo_com2(void)
 		cmd_buf[2] = '\r';
 		cmd_len = 3;
 		upsdebugx(2, "COM2: Sending Q1 command (iteration %u)", com2_iteration);
-	}
-	
-	/* Increment iteration counter, reset at 1000 to prevent overflow */
-	com2_iteration++;
-	if (com2_iteration >= 1000) {
-		com2_iteration = 0;  /* Reset to 0 for predictable behavior */
-	}
-	
-	/* Send command with pacing - show hex dump at debug level 3 */
-	if (cmd_len == 4) {
-		upsdebugx(3, "COM2: TX → [0x%02x 0x%02x 0x%02x 0x%02x] \"DQ1\\r\"",
-		          cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3]);
-	} else {
-		upsdebugx(3, "COM2: TX → [0x%02x 0x%02x 0x%02x] \"Q1\\r\"",
-		          cmd_buf[0], cmd_buf[1], cmd_buf[2]);
 	}
 	
 	/* Flush input buffer before sending command to prevent stale data */
@@ -860,11 +933,22 @@ static void com2_detect_events(void)
 	} else if (event_tracking.prev_status[0] == 1 && com2_current.status_bits[0] == 0) {
 		snprintf(event_buf, sizeof(event_buf), "power_restore");
 	}
-	/* b5: AVR/Bypass on/off */
+	/* b5: Bypass/AVR on/off - distinguish using b3 state
+	 * b3=0 + b5 change → bypass event
+	 * b3=1 + b5 change → AVR event
+	 * From Java ConCOM2Get.java bypassflag/avrflag logic */
 	else if (event_tracking.prev_status[2] == 0 && com2_current.status_bits[2] == 1) {
-		snprintf(event_buf, sizeof(event_buf), "avr_bypass_active");
+		if (com2_current.status_bits[4] == 0) {
+			snprintf(event_buf, sizeof(event_buf), "bypass_active");
+		} else {
+			snprintf(event_buf, sizeof(event_buf), "avr_active");
+		}
 	} else if (event_tracking.prev_status[2] == 1 && com2_current.status_bits[2] == 0) {
-		snprintf(event_buf, sizeof(event_buf), "avr_bypass_inactive");
+		if (com2_current.status_bits[4] == 0) {
+			snprintf(event_buf, sizeof(event_buf), "bypass_inactive");
+		} else {
+			snprintf(event_buf, sizeof(event_buf), "avr_inactive");
+		}
 	}
 	/* b2: Test start/stop */
 	else if (event_tracking.prev_status[5] == 0 && com2_current.status_bits[5] == 1) {
@@ -959,15 +1043,32 @@ static void com2_update_vars(void)
 		status_set("LB");
 	}
 	
-	/* b5 (status_bits[2]): AVR active (Buck/Boost regulation) */
+	/* b5 (status_bits[2]): Bypass/AVR active
+	 * b3 (status_bits[4]) determines the mode:
+	 *   b3=0 (online) + b5=1 → BYPASS (pass-through mode)
+	 *   b3=1 (offline) + b5=1 → AVR Buck or Boost (voltage regulation)
+	 * From Java ConCOM2Get.java lines 477-527
+	 */
 	if (com2_current.status_bits[2] == 1) {
-		/* Determine AVR direction: Buck (reduce) vs Boost (increase) */
-		if (com2_current.input_voltage > com2_current.output_voltage) {
-			status_set("TRIM");  /* Buck/Reduce voltage */
-		} else if (com2_current.output_voltage > com2_current.input_voltage) {
-			status_set("BOOST");  /* Boost/Increase voltage */
+		if (com2_current.status_bits[4] == 0) {
+			/* b3=0 (online mode): Bypass active - UPS passing power directly */
+			status_set("BYPASS");
+			upsdebugx(2, "STATUS: Bypass mode active");
+		} else if (com2_current.status_bits[4] == 1) {
+			/* b3=1 (offline/regulation mode): AVR active - Buck or Boost */
+			if (com2_current.input_voltage > com2_current.output_voltage) {
+				status_set("TRIM");  /* Buck/Reduce voltage */
+				upsdebugx(2, "STATUS: AVR Buck (TRIM): in=%.1f out=%.1f",
+				          com2_current.input_voltage, com2_current.output_voltage);
+			} else if (com2_current.output_voltage > com2_current.input_voltage) {
+				status_set("BOOST");  /* Boost/Increase voltage */
+				upsdebugx(2, "STATUS: AVR Boost: in=%.1f out=%.1f",
+				          com2_current.input_voltage, com2_current.output_voltage);
+			}
 		}
-		/* Note: Removed inappropriate BYPASS status - this is line-interactive UPS */
+		/* b3=2 or 3: battery fault (already handled above with status_bits[4] >= 2).
+		 * status_bits[4] holds the raw b3 digit ('0'-'3' mapped to 0-3)
+		 * b3=0: online, b3=1: offline/regulation, b3=2/3: battery fault → RB */
 	}
 	
 	/* b4 (status_bits[3]): UPS fault */
@@ -1016,6 +1117,246 @@ static void com2_update_vars(void)
 		dstate_delinfo("ups.event.last");
 		dstate_delinfo("ups.event.time");
 	}
+}
+
+/* COM2: Send the I command and parse UPS identity response
+ * Response format: '#' + mfr(15) + ' ' + model(10) + ' ' + ' ' + firmware(9) = 38 bytes
+ * From Java ConCOM2Get.java IBO handling and ConCOM2Set.java I command
+ */
+
+/* Helper: trim trailing spaces from a string in-place */
+static void rtrim_spaces(char *s) {
+	int i = (int)strlen(s) - 1;
+	while (i >= 0 && s[i] == ' ') s[i--] = '\0';
+}
+
+static int ups_com2_identify(void)
+{
+	char cmd_buf[4];
+	unsigned char response[64];
+	ssize_t ret;
+	char mfr[16], model[12], firmware[12];
+
+	/* Send I\r command */
+	cmd_buf[0] = 'I';
+	cmd_buf[1] = '\r';
+	ser_flush_in(upsfd, "", 0);
+	ret = ser_send_buf_pace(upsfd, 10, cmd_buf, 2);
+	if (ret != 2) {
+		upsdebugx(1, "COM2: Failed to send I command");
+		return 0;
+	}
+
+	memset(response, 0, sizeof(response));
+	ret = ser_get_line(upsfd, response, sizeof(response) - 1, '\r', "", 0, 2000000);
+	if (ret < 38) {
+		upsdebugx(2, "COM2: I command response too short (%" PRIiSIZE " bytes)", ret);
+		return 0;
+	}
+
+	/* Response starts with '#' */
+	if (response[0] != '#') {
+		upsdebugx(2, "COM2: I command response doesn't start with '#'");
+		return 0;
+	}
+
+	/* Extract fields: mfr at offset 1 (15 chars), model at offset 17 (10 chars),
+	 * firmware at offset 29 (9 chars) */
+	snprintf(mfr, sizeof(mfr), "%.15s", (char *)response + 1);
+	rtrim_spaces(mfr);
+
+	if (ret >= 27) {
+		snprintf(model, sizeof(model), "%.10s", (char *)response + 17);
+		rtrim_spaces(model);
+		if (model[0] != '\0') {
+			dstate_setinfo("ups.model", "%s", model);
+			upsdebugx(1, "COM2 I: model='%s'", model);
+		}
+	}
+
+	if (ret >= 38) {
+		snprintf(firmware, sizeof(firmware), "%.9s", (char *)response + 29);
+		rtrim_spaces(firmware);
+		if (firmware[0] != '\0') {
+			dstate_setinfo("ups.firmware", "%s", firmware);
+			upsdebugx(1, "COM2 I: firmware='%s'", firmware);
+		}
+	}
+
+	if (mfr[0] != '\0') {
+		dstate_setinfo("ups.mfr", "%s", mfr);
+		upsdebugx(1, "COM2 I: mfr='%s'", mfr);
+	}
+
+	return 1;
+}
+
+/* COM2: Send the F command and parse factory configuration response
+ * Response format: '#' + outputV(5) + gap(5) + battV(5) + ' ' + freq(4) = >20 bytes
+ * From Java ConCOM2Get.java FBO handling
+ */
+static int ups_com2_get_config(void)
+{
+	char cmd_buf[4];
+	unsigned char response[64];
+	ssize_t ret;
+	char tmp[8];
+	double val;
+
+	/* Send F\r command */
+	cmd_buf[0] = 'F';
+	cmd_buf[1] = '\r';
+	ser_flush_in(upsfd, "", 0);
+	ret = ser_send_buf_pace(upsfd, 10, cmd_buf, 2);
+	if (ret != 2) {
+		upsdebugx(1, "COM2: Failed to send F command");
+		return 0;
+	}
+
+	memset(response, 0, sizeof(response));
+	ret = ser_get_line(upsfd, response, sizeof(response) - 1, '\r', "", 0, 2000000);
+	if (ret <= 20) {
+		upsdebugx(2, "COM2: F command response too short (%" PRIiSIZE " bytes)", ret);
+		return 0;
+	}
+
+	/* Response starts with '#' */
+	if (response[0] != '#') {
+		upsdebugx(2, "COM2: F command response doesn't start with '#'");
+		return 0;
+	}
+
+	/* Output voltage nominal: offset 1, 5 chars */
+	snprintf(tmp, sizeof(tmp), "%.5s", (char *)response + 1);
+	val = strtod(tmp, NULL);
+	if (val > 0) {
+		dstate_setinfo("output.voltage.nominal", "%.1f", val);
+		upsdebugx(1, "COM2 F: output.voltage.nominal=%.1f", val);
+	}
+
+	/* Battery voltage nominal: offset 11, 5 chars */
+	if (ret >= 16) {
+		snprintf(tmp, sizeof(tmp), "%.5s", (char *)response + 11);
+		val = strtod(tmp, NULL);
+		if (val > 0) {
+			dstate_setinfo("battery.voltage.nominal", "%.1f", val);
+			upsdebugx(1, "COM2 F: battery.voltage.nominal=%.1f", val);
+		}
+	}
+
+	/* Frequency nominal: offset 17, 4 chars */
+	if (ret >= 21) {
+		snprintf(tmp, sizeof(tmp), "%.4s", (char *)response + 17);
+		val = strtod(tmp, NULL);
+		if (val > 0) {
+			dstate_setinfo("input.frequency.nominal", "%.1f", val);
+			upsdebugx(1, "COM2 F: input.frequency.nominal=%.1f", val);
+		}
+	}
+
+	return 1;
+}
+
+/* COM2: Query battery runtime via Rt command
+ * Response format: '#NNN' (4 bytes, NNN = backup minutes)
+ * From Java ConCOM2Get.java rtBO handling and ConCOM2Set.java Rt command
+ */
+static int ups_com2_get_runtime(void)
+{
+	char cmd_buf[4];
+	unsigned char response[16];
+	ssize_t ret;
+	char tmp[8];
+	int minutes;
+
+	/* Send Rt\r command */
+	cmd_buf[0] = 'R';
+	cmd_buf[1] = 't';
+	cmd_buf[2] = '\r';
+	ser_flush_in(upsfd, "", 0);
+	ret = ser_send_buf_pace(upsfd, 10, cmd_buf, 3);
+	if (ret != 3) {
+		upsdebugx(2, "COM2: Failed to send Rt command");
+		return 0;
+	}
+
+	memset(response, 0, sizeof(response));
+	ret = ser_get_line(upsfd, response, sizeof(response) - 1, '\r', "", 0, 2000000);
+	if (ret < 4) {
+		upsdebugx(2, "COM2: Rt response too short (%" PRIiSIZE " bytes)", ret);
+		return 0;
+	}
+
+	/* Response: '#NNN' */
+	if (response[0] != '#') {
+		upsdebugx(2, "COM2: Rt response doesn't start with '#'");
+		return 0;
+	}
+
+	snprintf(tmp, sizeof(tmp), "%.3s", (char *)response + 1);
+	{
+		char *endptr = NULL;
+		long lval = strtol(tmp, &endptr, 10);
+		minutes = (endptr != tmp && lval > 0) ? (int)lval : 0;
+	}
+	if (minutes > 0) {
+		/* Convert minutes to seconds for battery.runtime */
+		dstate_setinfo("battery.runtime", "%d", minutes * 60);
+		upsdebugx(2, "COM2 Rt: battery.runtime=%d s (%d min)", minutes * 60, minutes);
+	}
+
+	return 1;
+}
+
+/* COM2: Query output power via Yop command
+ * Response format: '*NNNNN' (6 bytes, NNNNN = output power in VA)
+ * From Java ConCOM2Get.java YopBO handling and ConCOM2Set.java Yop command
+ */
+static int ups_com2_get_power(void)
+{
+	char cmd_buf[8];
+	unsigned char response[16];
+	ssize_t ret;
+	char tmp[8];
+	int power_va;
+
+	/* Send Yop\r command */
+	cmd_buf[0] = 'Y';
+	cmd_buf[1] = 'o';
+	cmd_buf[2] = 'p';
+	cmd_buf[3] = '\r';
+	ser_flush_in(upsfd, "", 0);
+	ret = ser_send_buf_pace(upsfd, 10, cmd_buf, 4);
+	if (ret != 4) {
+		upsdebugx(2, "COM2: Failed to send Yop command");
+		return 0;
+	}
+
+	memset(response, 0, sizeof(response));
+	ret = ser_get_line(upsfd, response, sizeof(response) - 1, '\r', "", 0, 2000000);
+	if (ret < 6) {
+		upsdebugx(2, "COM2: Yop response too short (%" PRIiSIZE " bytes)", ret);
+		return 0;
+	}
+
+	/* Response: '*NNNNN' */
+	if (response[0] != '*') {
+		upsdebugx(2, "COM2: Yop response doesn't start with '*'");
+		return 0;
+	}
+
+	snprintf(tmp, sizeof(tmp), "%.5s", (char *)response + 1);
+	{
+		char *endptr = NULL;
+		long lval = strtol(tmp, &endptr, 10);
+		power_va = (endptr != tmp && lval > 0) ? (int)lval : 0;
+	}
+	if (power_va > 0) {
+		dstate_setinfo("ups.power", "%d", power_va);
+		upsdebugx(2, "COM2 Yop: ups.power=%d VA", power_va);
+	}
+
+	return 1;
 }
 
 /* Auto-detect protocol mode */
@@ -1947,8 +2288,17 @@ void upsdrv_help(void)
 	printf("                       (COM2 has richer features: events, temperature, battery voltage)\n");
 	printf("                 com1: binary protocol at 1200 baud (older models)\n");
 	printf("                 com2: ASCII protocol at 2400 baud (newer models, IMP-525 etc.)\n");
-	printf("                NOTE: COM2 automatically alternates between Q1 and DQ1 commands\n");
-	printf("                      like the original Java driver (no configuration needed)\n");
+	printf("                COM2 init sequence (matching Java UPSMON):\n");
+	printf("                  - I command: reads ups.mfr, ups.model, ups.firmware\n");
+	printf("                  - F command: reads output.voltage.nominal, battery.voltage.nominal,\n");
+	printf("                              input.frequency.nominal\n");
+	printf("                  - Q1/DQ1 commands alternate for status polling\n");
+	printf("                  - Rt command (every 10 polls): reads battery.runtime\n");
+	printf("                  - Yop command (every 15 polls): reads ups.power\n");
+	printf("                COM2 instant commands: test.battery.start, test.battery.start.deep,\n");
+	printf("                  test.battery.stop, beeper.toggle, beeper.enable, beeper.disable,\n");
+	printf("                  outlet.1.load.on, outlet.1.load.off,\n");
+	printf("                  outlet.2.load.on, outlet.2.load.off\n");
 	printf(" event_hold:    Event latch time in seconds (default: 20, range: 1-300)\n");
 	printf(" allow_control: Enable dangerous commands: 'yes' or 'no' (default: 'no')\n");
 	printf("                When 'yes', enables shutdown.stayoff.dangerous command\n");
@@ -2096,10 +2446,24 @@ void upsdrv_initinfo(void)
 			}
 		}
 	} else if (current_protocol == PROTOCOL_COM2) {
-		/* COM2 protocol detected - use modelname from config or Unknown */
+		/* COM2 protocol detected - send I command to get model/firmware info
+		 * From Java ConCOM2Set.java: roopINT <= 2 sends I command first
+		 * From Java ConCOM2Get.java IBO handling: parses model, mfr, firmware */
 		upsdebugx(1, "Using COM2 protocol (ASCII, 2400 baud)");
-		upsdebugx(1, "Model: %s (from config)", modelname);
-		/* Battery test for COM2 uses different commands (handled via instcmd) */
+		upsdebugx(1, "Sending I command for UPS identification...");
+		if (!ups_com2_identify()) {
+			upsdebugx(1, "COM2 I command failed or not supported by this UPS");
+		}
+		/* Send F command to get nominal configuration
+		 * From Java ConCOM2Set.java: roopINT <= 4 sends F command
+		 * From Java ConCOM2Get.java FBO handling: parses nominal voltages and frequency */
+		upsdebugx(1, "Sending F command for UPS configuration...");
+		if (!ups_com2_get_config()) {
+			upsdebugx(1, "COM2 F command failed or not supported by this UPS");
+		}
+		/* Start iteration at 5 (after I/F init commands), matching Java roopINT=5
+		 * after F command processing sets roopINT=5 */
+		com2_iteration = 5;
 	}
 
 	upsdebugx(1, "Values of arguments:");
@@ -2197,11 +2561,16 @@ void upsdrv_initinfo(void)
 	 * so current_protocol reflects the actual detected/configured protocol.
 	 */
 	if (current_protocol == PROTOCOL_COM2) {
+		dstate_addcmd ("test.battery.start.deep");
 		dstate_addcmd ("test.battery.stop");
 		dstate_addcmd ("beeper.toggle");
 		dstate_addcmd ("beeper.enable");
 		dstate_addcmd ("beeper.disable");
-		upsdebugx(1, "Added COM2-specific commands (test.battery.stop, beeper.*)");
+		dstate_addcmd ("outlet.1.load.on");
+		dstate_addcmd ("outlet.1.load.off");
+		dstate_addcmd ("outlet.2.load.on");
+		dstate_addcmd ("outlet.2.load.off");
+		upsdebugx(1, "Added COM2-specific commands");
 		if (allow_control) {
 			dstate_addcmd ("shutdown.stayoff.dangerous");
 			upslogx(LOG_WARNING, "Dangerous shutdown commands enabled");
