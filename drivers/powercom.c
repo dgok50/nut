@@ -708,11 +708,12 @@ static int ups_getinfo_com2(void)
 	char response_copy[128];
 
 	/* Increment iteration counter, reset at 1000 to prevent overflow
-	 * Starts at 5 (after I/F init commands at 1-4 handled in upsdrv_initinfo)
-	 * Mirrors Java ConCOM2Set.java roopINT logic */
+	 * Starts at 5 after upsdrv_initinfo() sets com2_iteration=5 (after I/F init commands)
+	 * After overflow (>=1000), reset to 20 to skip the startup-phase iteration range
+	 * Mirrors Java ConCOM2Set.java: roopINT starts at 1, resets from 1000 to 20 */
 	com2_iteration++;
 	if (com2_iteration >= 1000) {
-		com2_iteration = 20;  /* Reset like Java: resets to 20 */
+		com2_iteration = 20;  /* Reset past startup range (1-19), matching Java reset to 20 */
 	}
 
 	/* Periodically send Rt (runtime) command: every 10 iterations
@@ -1065,7 +1066,9 @@ static void com2_update_vars(void)
 				          com2_current.input_voltage, com2_current.output_voltage);
 			}
 		}
-		/* b3=2 or 3 means battery fault, already handled above */
+		/* b3=2 or 3: battery fault (already handled above with status_bits[4] >= 2).
+		 * status_bits[4] holds the raw b3 digit ('0'-'3' mapped to 0-3)
+		 * b3=0: online, b3=1: offline/regulation, b3=2/3: battery fault → RB */
 	}
 	
 	/* b4 (status_bits[3]): UPS fault */
@@ -1120,6 +1123,13 @@ static void com2_update_vars(void)
  * Response format: '#' + mfr(15) + ' ' + model(10) + ' ' + ' ' + firmware(9) = 38 bytes
  * From Java ConCOM2Get.java IBO handling and ConCOM2Set.java I command
  */
+
+/* Helper: trim trailing spaces from a string in-place */
+static void rtrim_spaces(char *s) {
+	int i = (int)strlen(s) - 1;
+	while (i >= 0 && s[i] == ' ') s[i--] = '\0';
+}
+
 static int ups_com2_identify(void)
 {
 	char cmd_buf[4];
@@ -1153,18 +1163,11 @@ static int ups_com2_identify(void)
 	/* Extract fields: mfr at offset 1 (15 chars), model at offset 17 (10 chars),
 	 * firmware at offset 29 (9 chars) */
 	snprintf(mfr, sizeof(mfr), "%.15s", (char *)response + 1);
-	/* Trim trailing spaces */
-	{
-		int i = (int)strlen(mfr) - 1;
-		while (i >= 0 && mfr[i] == ' ') mfr[i--] = '\0';
-	}
+	rtrim_spaces(mfr);
 
 	if (ret >= 27) {
 		snprintf(model, sizeof(model), "%.10s", (char *)response + 17);
-		{
-			int i = (int)strlen(model) - 1;
-			while (i >= 0 && model[i] == ' ') model[i--] = '\0';
-		}
+		rtrim_spaces(model);
 		if (model[0] != '\0') {
 			dstate_setinfo("ups.model", "%s", model);
 			upsdebugx(1, "COM2 I: model='%s'", model);
@@ -1173,10 +1176,7 @@ static int ups_com2_identify(void)
 
 	if (ret >= 38) {
 		snprintf(firmware, sizeof(firmware), "%.9s", (char *)response + 29);
-		{
-			int i = (int)strlen(firmware) - 1;
-			while (i >= 0 && firmware[i] == ' ') firmware[i--] = '\0';
-		}
+		rtrim_spaces(firmware);
 		if (firmware[0] != '\0') {
 			dstate_setinfo("ups.firmware", "%s", firmware);
 			upsdebugx(1, "COM2 I: firmware='%s'", firmware);
@@ -1294,7 +1294,11 @@ static int ups_com2_get_runtime(void)
 	}
 
 	snprintf(tmp, sizeof(tmp), "%.3s", (char *)response + 1);
-	minutes = atoi(tmp);
+	{
+		char *endptr = NULL;
+		long lval = strtol(tmp, &endptr, 10);
+		minutes = (endptr != tmp && lval > 0) ? (int)lval : 0;
+	}
 	if (minutes > 0) {
 		/* Convert minutes to seconds for battery.runtime */
 		dstate_setinfo("battery.runtime", "%d", minutes * 60);
@@ -1342,7 +1346,11 @@ static int ups_com2_get_power(void)
 	}
 
 	snprintf(tmp, sizeof(tmp), "%.5s", (char *)response + 1);
-	power_va = atoi(tmp);
+	{
+		char *endptr = NULL;
+		long lval = strtol(tmp, &endptr, 10);
+		power_va = (endptr != tmp && lval > 0) ? (int)lval : 0;
+	}
 	if (power_va > 0) {
 		dstate_setinfo("ups.power", "%d", power_va);
 		upsdebugx(2, "COM2 Yop: ups.power=%d VA", power_va);
