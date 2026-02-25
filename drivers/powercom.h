@@ -38,6 +38,33 @@
 #include "timehead.h"
 
 
+/* COM2 protocol mode enumeration */
+enum protocol_mode {
+	PROTOCOL_AUTO = 0,
+	PROTOCOL_COM1 = 1,
+	PROTOCOL_COM2 = 2
+};
+
+/* COM2 parsed data structure */
+struct com2_data {
+	float input_voltage;
+	float output_voltage;
+	float load;
+	float frequency;
+	float battery_level;
+	float temperature;
+	unsigned char status_bits[8];  /* b7-b0 as individual bits */
+	time_t last_valid;
+};
+
+/* Event tracking structure */
+struct event_state {
+	unsigned char prev_status[8];
+	time_t last_event_time;
+	char last_event[128];
+	unsigned int event_count;
+};
+
 /* supported types */
 struct type {
 	const char    *name;

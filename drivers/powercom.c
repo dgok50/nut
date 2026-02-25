@@ -84,9 +84,12 @@
 #include "serial.h"
 #include "powercom.h"
 #include "nut_float.h"
+#include <string.h>
+#include <math.h>
+#include <ctype.h>
 
 #define DRIVER_NAME	"PowerCom protocol UPS driver"
-#define DRIVER_VERSION	"0.27"
+#define DRIVER_VERSION	"0.28"
 
 /* driver description structure */
 upsdrv_info_t	upsdrv_info = {
@@ -116,6 +119,19 @@ static const char *manufacturer = "PowerCom";
 static const char *modelname    = "Unknown";
 static const char *serialnumber = "Unknown";
 static unsigned int type = 0;
+
+/* COM2 protocol variables */
+static enum protocol_mode current_protocol = PROTOCOL_AUTO;
+static enum protocol_mode configured_protocol = PROTOCOL_AUTO;
+static struct com2_data com2_current;
+static struct event_state event_tracking;
+static unsigned int com2_iteration = 0;  /* Alternates between Q1 and DQ1 like Java driver */
+static unsigned int event_hold_time = 20;  /* seconds to latch events */
+static int allow_control = 0;  /* allow dangerous commands */
+static time_t last_mode_switch = 0;
+static int com1_fail_count = 0;
+static int com2_fail_count = 0;
+static speed_t current_speed = 0;  /* Track current baud rate to avoid redundant ser_set_speed calls */
 
 
 /* forward declaration of functions used to setup flow control */
@@ -263,19 +279,21 @@ enum data {
 /* status bits */
 enum status {
 	SUMMARY       = 0U,
-	MAINS_FAILURE = 1U,
+	MAINS_FAILURE = 1U,   /* Byte 9, bit 0 - STATUS_A */
 	ONLINE        = 1U,
-	FAULT         = 1U,
-	LOW_BAT       = 2U,
+	FAULT         = 1U,   /* Byte 10, bit 0 - STATUS_B */
+	LOW_BAT       = 2U,   /* Byte 9, bit 1 - STATUS_A */
 	BAD_BAT       = 2U,
-	TEST          = 4U,
-	AVR_ON        = 8U,
-	AVR_MODE      = 16U,
+	BAD_BATTERY   = 2U,   /* Byte 10, bit 1 - STATUS_B - Battery failed/defective */
+	TEST          = 4U,   /* Byte 10, bit 2 - STATUS_B */
+	AVR_ON        = 8U,   /* Byte 9, bit 3 - STATUS_A */
+	BEEPER_STATUS = 8U,   /* Byte 10, bit 3 - STATUS_B - 0=ON, 1=OFF */
+	AVR_MODE      = 16U,  /* Byte 10, bit 4 - STATUS_B */
 	SD_COUNTER    = 16U,
-	OVERLOAD      = 32U,
+	OVERLOAD      = 32U,  /* Byte 9, bit 5 - STATUS_A */
 	SHED_COUNTER  = 32U,
 	DIS_NOLOAD    = 64U,
-	SD_DISPLAY    = 128U,
+	SD_DISPLAY    = 128U, /* Byte 10, bit 7 - STATUS_B */
 	OFF           = 128U
 };
 
@@ -317,15 +335,94 @@ static void shutdown_ret(void)
 /* registered instant commands */
 static int instcmd (const char *cmdname, const char *extra)
 {
+	char cmd_buf[8];
+	int cmd_len;
+	
 	/* May be used in logging below, but not as a command argument */
 	NUT_UNUSED_VARIABLE(extra);
 	upsdebug_INSTCMD_STARTING(cmdname, extra);
 
+	/* COM1 commands */
 	if (!strcasecmp(cmdname, "test.battery.start")) {
 		upslog_INSTCMD_POWERSTATE_MAYBE(cmdname, extra);
-		ser_send_char (upsfd, BATTERY_TEST);
-		return STAT_INSTCMD_HANDLED;
+		if (current_protocol == PROTOCOL_COM2) {
+			/* COM2: T command */
+			cmd_buf[0] = 'T';
+			cmd_buf[1] = '\r';
+			cmd_len = 2;
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		} else {
+			ser_send_char (upsfd, BATTERY_TEST);
+			return STAT_INSTCMD_HANDLED;
+		}
 	}
+	
+	/* COM2-specific commands */
+	if (current_protocol == PROTOCOL_COM2) {
+		if (!strcasecmp(cmdname, "test.battery.stop")) {
+			upslog_INSTCMD_POWERSTATE_MAYBE(cmdname, extra);
+			/* COM2: CT command */
+			cmd_buf[0] = 'C';
+			cmd_buf[1] = 'T';
+			cmd_buf[2] = '\r';
+			cmd_len = 3;
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		}
+		
+		if (!strcasecmp(cmdname, "beeper.toggle")) {
+			/* COM2: Q command */
+			cmd_buf[0] = 'Q';
+			cmd_buf[1] = '\r';
+			cmd_len = 2;
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		}
+		
+		/* beeper.enable and beeper.disable use same Q command (toggle) */
+		if (!strcasecmp(cmdname, "beeper.enable") || !strcasecmp(cmdname, "beeper.disable")) {
+			/* COM2: Q command toggles beeper */
+			cmd_buf[0] = 'Q';
+			cmd_buf[1] = '\r';
+			cmd_len = 2;
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				upslogx(LOG_INFO, "Beeper toggled (current state will change)");
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		}
+		
+		/* Dangerous commands - require allow_control=yes */
+		if (!strcasecmp(cmdname, "shutdown.stayoff.dangerous")) {
+			if (!allow_control) {
+				upslogx(LOG_WARNING, "Command %s requires allow_control=yes", cmdname);
+				return STAT_INSTCMD_FAILED;
+			}
+			upslog_INSTCMD_POWERSTATE_CHANGE(cmdname, extra);
+			/* COM2: S0X command (X = delay in minutes) */
+			upslogx(LOG_WARNING, "Executing dangerous shutdown command");
+			cmd_buf[0] = 'S';
+			cmd_buf[1] = '0';
+			cmd_buf[2] = '1';  /* 1 minute delay */
+			cmd_buf[3] = '\r';
+			cmd_len = 4;
+			if (ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len) == cmd_len) {
+				if (handling_upsdrv_shutdown > 0)
+					set_exit_flag(EF_EXIT_SUCCESS);
+				return STAT_INSTCMD_HANDLED;
+			}
+			return STAT_INSTCMD_FAILED;
+		}
+	}
+	
+	/* COM1 shutdown commands */
 	if (!strcasecmp(cmdname, "shutdown.return")) {
 		/* NOTE: In this context, "return" is UPS behavior after the
 		 * wall-power gets restored. The routine exits the driver anyway.
@@ -432,6 +529,644 @@ static int ups_getinfo(void)
 	return 1;
 }
 
+/* ========== COM2 Protocol Implementation ========== */
+
+/* COM2: Parse status bits from 8-character string (b7-b0)
+ * Status field format: 8 ASCII characters representing bits
+ * b7=1: Power failure, b6=1: Battery low, b5=1: Bypass/AVR active
+ * b4=1: UPS fault, b3: 0=Online 1=Offline 2/3=Battery fault
+ * b2=1: Self-test running, b1=1: UPS output OFF, b0=1: Beeper disabled
+ */
+static int parse_com2_status(const char *status_str, unsigned char *bits)
+{
+	size_t len;
+	int i;
+	char clean_str[16];
+	const char *p = status_str;
+	
+	/* Ensure string is null-terminated and has valid length */
+	if (!status_str) {
+		return 0;
+	}
+	
+	/* Copy status string, removing trailing \r, \n, ) characters */
+	len = 0;
+	while (*p && len < 15 && *p != '\r' && *p != '\n' && *p != ')') {
+		clean_str[len++] = *p++;
+	}
+	clean_str[len] = '\0';
+	
+	/* Status string must be exactly 8 characters */
+	if (len != 8) {
+		upsdebugx(2, "COM2: Invalid status length %zu (expected 8): '%s'", len, clean_str);
+		return 0;
+	}
+	
+	/* Parse each bit with strict validation:
+	 * - Bits b0,b1,b2,b4,b5,b6,b7 (indices 7,6,5,3,2,1,0) must be binary '0' or '1'
+	 * - Bit b3 (index 4) can be '0'..'3' (represents state nibble)
+	 */
+	for (i = 0; i < 8; i++) {
+		if (i == 4) {
+			/* b3 (index 4): Allow 0..3 for state nibble */
+			if (clean_str[i] < '0' || clean_str[i] > '3') {
+				upsdebugx(2, "COM2: Invalid b3 value '%c' at position %d (expected 0-3)", 
+				          clean_str[i], i);
+				return 0;
+			}
+		} else {
+			/* All other bits: Only allow binary 0/1 */
+			if (clean_str[i] != '0' && clean_str[i] != '1') {
+				upsdebugx(2, "COM2: Invalid bit value '%c' at position %d (expected 0 or 1)", 
+				          clean_str[i], i);
+				return 0;
+			}
+		}
+		bits[i] = clean_str[i] - '0';
+	}
+	
+	upsdebugx(3, "COM2: Status parsed: '%s' → bits[b7..b0]=%d%d%d%d%d%d%d%d",
+	          clean_str,
+	          bits[0], bits[1], bits[2], bits[3], bits[4], bits[5], bits[6], bits[7]);
+	
+	return 1;
+}
+
+/* COM2: Minimum response length for valid COM2 response
+ * Format: "(InputV OutputV Load Freq BattLevel Temp Status"
+ * Minimum example: "(100 200 10 50.0 100 25 00000000" = 46 bytes
+ */
+#define COM2_MIN_RESPONSE_LEN 46
+
+/* Helper: Set serial speed only if it differs from current speed
+ * Reduces overhead by avoiding redundant ser_set_speed calls
+ * Returns 1 on success, 0 on failure
+ */
+static int set_speed_if_needed(speed_t new_speed)
+{
+	if (current_speed == new_speed) {
+		upsdebugx(3, "Speed already set to %d, skipping ser_set_speed", (int)new_speed);
+		return 1;
+	}
+	
+	upsdebugx(2, "Setting serial speed to %d baud", (int)new_speed);
+	if (ser_set_speed(upsfd, device_path, new_speed) == -1) {
+		upsdebugx(1, "Failed to set serial speed to %d", (int)new_speed);
+		return 0;
+	}
+	
+	current_speed = new_speed;
+	
+	/* Small delay only on actual speed change (10ms, not 100ms) */
+	{
+		struct timespec ts;
+		ts.tv_sec = 0;
+		ts.tv_nsec = 10000000L;  /* 10ms - reduced from 100ms */
+		nanosleep(&ts, NULL);
+	}
+	
+	return 1;
+}
+
+/* COM2: Send command and read ASCII response
+ * Command: Q1 or DQ1 followed by \r
+ * Response format: (InputV OutputV Load Freq BattLevel Temp Status
+ * Returns 1 on success, 0 on failure
+ */
+static int ups_getinfo_com2(void)
+{
+	char cmd_buf[8];
+	unsigned char response[128];
+	ssize_t ret;
+	int cmd_len;
+	char *token;
+	char *saveptr = NULL;
+	int field_count = 0;
+	char response_copy[128];
+	
+	/* Alternate between DQ1 (even) and Q1 (odd) like the original Java driver
+	 * ConCOM2Set.java lines 186-194:
+	 *   if (roopINT % 2 == 0) { write(a1); }  // DQ1
+	 *   else { write(a2); }                   // Q1
+	 */
+	if (com2_iteration % 2 == 0) {
+		/* Even iteration: DQ1 command */
+		cmd_buf[0] = 'D';
+		cmd_buf[1] = 'Q';
+		cmd_buf[2] = '1';
+		cmd_buf[3] = '\r';
+		cmd_len = 4;
+		upsdebugx(2, "COM2: Sending DQ1 command (iteration %u)", com2_iteration);
+	} else {
+		/* Odd iteration: Q1 command */
+		cmd_buf[0] = 'Q';
+		cmd_buf[1] = '1';
+		cmd_buf[2] = '\r';
+		cmd_len = 3;
+		upsdebugx(2, "COM2: Sending Q1 command (iteration %u)", com2_iteration);
+	}
+	
+	/* Increment iteration counter, reset at 1000 to prevent overflow */
+	com2_iteration++;
+	if (com2_iteration >= 1000) {
+		com2_iteration = 0;  /* Reset to 0 for predictable behavior */
+	}
+	
+	/* Send command with pacing - show hex dump at debug level 3 */
+	if (cmd_len == 4) {
+		upsdebugx(3, "COM2: TX → [0x%02x 0x%02x 0x%02x 0x%02x] \"DQ1\\r\"",
+		          cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3]);
+	} else {
+		upsdebugx(3, "COM2: TX → [0x%02x 0x%02x 0x%02x] \"Q1\\r\"",
+		          cmd_buf[0], cmd_buf[1], cmd_buf[2]);
+	}
+	
+	/* Flush input buffer before sending command to prevent stale data */
+	ser_flush_in(upsfd, "", 0);
+	
+	ret = ser_send_buf_pace(upsfd, 10, cmd_buf, cmd_len);
+	if (ret != cmd_len) {
+		upsdebugx(1, "COM2: Failed to send command (sent %" PRIiSIZE " of %d bytes)", ret, cmd_len);
+		return 0;
+	}
+	
+	/* Read response line until \r with 500ms timeout
+	 * ser_get_line reads until endchar (\r), preventing fragmentation and reducing lag */
+	upsdebugx(3, "COM2: Reading response (waiting for \\r, timeout 500ms)...");
+	memset(response, 0, sizeof(response));
+	ret = ser_get_line(upsfd, response, sizeof(response) - 1, '\r', "", 0, 500000);
+	
+	/* Show what we received (or didn't) */
+	if (ret > 0) {
+		upsdebugx(3, "COM2: RX ← %" PRIiSIZE " bytes (terminated at \\r)", ret);
+		/* Show first few bytes in hex for diagnostics */
+		if (ret >= 4) {
+			upsdebugx(3, "COM2: First bytes: [0x%02x 0x%02x 0x%02x 0x%02x ...] \"%c%c%c%c...\"",
+			          (unsigned char)response[0], (unsigned char)response[1], 
+			          (unsigned char)response[2], (unsigned char)response[3],
+			          isprint((unsigned char)response[0]) ? response[0] : '.',
+			          isprint((unsigned char)response[1]) ? response[1] : '.',
+			          isprint((unsigned char)response[2]) ? response[2] : '.',
+			          isprint((unsigned char)response[3]) ? response[3] : '.');
+		}
+	} else {
+		upsdebugx(3, "COM2: RX ← 0 bytes (timeout or UPS not responding)");
+	}
+	
+	if (ret < COM2_MIN_RESPONSE_LEN) {
+		upsdebugx(1, "COM2: Response too short (%" PRIiSIZE " bytes, expected >= %d) - UPS silent or wrong protocol", 
+		          ret, COM2_MIN_RESPONSE_LEN);
+		return 0;
+	}
+	
+	upsdebugx(2, "COM2: Received %" PRIiSIZE " bytes: %s", ret, response);
+	
+	/* Validate response starts with '(' */
+	if (response[0] != '(') {
+		upsdebugx(1, "COM2: Response doesn't start with '(' (got 0x%02x)", response[0]);
+		return 0;
+	}
+	
+	/* Parse space-separated fields - response is null-terminated by ser_get_buf_len */
+	snprintf(response_copy, sizeof(response_copy), "%s", response);
+	
+	/* Skip opening '(' and parse fields */
+	token = strtok_r(response_copy, " ", &saveptr);
+	if (!token || token[0] != '(') {
+		upsdebugx(2, "COM2: Invalid response format");
+		return 0;
+	}
+	
+	/* Field 0: Input Voltage (skip '(' prefix) */
+	com2_current.input_voltage = strtod(token + 1, NULL);
+	field_count++;
+	upsdebugx(3, "COM2: Field %d (Input V): %s → %.1f", field_count - 1, token, com2_current.input_voltage);
+	
+	/* Field 1: Fault Voltage or Second Output Voltage reading 
+	 * Some Q1 implementations include I/P fault voltage here.
+	 * Currently not used - investigate with real hardware if needed. */
+	token = strtok_r(NULL, " ", &saveptr);
+	if (!token) goto parse_error;
+	field_count++;
+	upsdebugx(3, "COM2: Field %d (Fault V / not used): %s", field_count - 1, token);
+	
+	/* Field 2: Output Voltage (actual/primary reading) */
+	token = strtok_r(NULL, " ", &saveptr);
+	if (!token) goto parse_error;
+	com2_current.output_voltage = strtod(token, NULL);
+	field_count++;
+	upsdebugx(3, "COM2: Field %d (Output V): %s → %.1f", field_count - 1, token, com2_current.output_voltage);
+	
+	/* Field 3: Load % */
+	token = strtok_r(NULL, " ", &saveptr);
+	if (!token) goto parse_error;
+	com2_current.load = strtod(token, NULL);
+	field_count++;
+	upsdebugx(3, "COM2: Field %d (Load %%): %s → %.1f", field_count - 1, token, com2_current.load);
+	
+	/* Field 4: Frequency */
+	token = strtok_r(NULL, " ", &saveptr);
+	if (!token) goto parse_error;
+	com2_current.frequency = strtod(token, NULL);
+	field_count++;
+	upsdebugx(3, "COM2: Field %d (Frequency): %s → %.1f", field_count - 1, token, com2_current.frequency);
+	
+	/* Field 5: Battery level or voltage */
+	token = strtok_r(NULL, " ", &saveptr);
+	if (!token) goto parse_error;
+	com2_current.battery_level = strtod(token, NULL);
+	field_count++;
+	upsdebugx(3, "COM2: Field %d (Battery): %s → %.1f", field_count - 1, token, com2_current.battery_level);
+	
+	/* Field 6: Temperature */
+	token = strtok_r(NULL, " ", &saveptr);
+	if (!token) goto parse_error;
+	com2_current.temperature = strtod(token, NULL);
+	field_count++;
+	upsdebugx(3, "COM2: Field %d (Temperature): %s → %.1f", field_count - 1, token, com2_current.temperature);
+	
+	/* Field 7: Status bits (8 characters) */
+	token = strtok_r(NULL, " ", &saveptr);
+	if (!token) goto parse_error;
+	upsdebugx(3, "COM2: Field %d (Status): '%s'", field_count, token);
+	if (!parse_com2_status(token, com2_current.status_bits)) {
+		upsdebugx(2, "COM2: Invalid status field");
+		return 0;
+	}
+	field_count++;
+	
+	if (field_count < 8) {
+		upsdebugx(2, "COM2: Insufficient fields (got %d, expected 8)", field_count);
+		goto parse_error;
+	}
+	
+	upsdebugx(3, "COM2: Successfully parsed %d fields", field_count);
+	
+	com2_current.last_valid = time(NULL);
+	
+	/* Debug output */
+	if (nut_debug_level > 2) {
+		upsdebugx(3, "COM2 parsed: InputV=%.1f OutputV=%.1f Load=%.1f Freq=%.1f Batt=%.1f Temp=%.1f",
+			com2_current.input_voltage, com2_current.output_voltage,
+			com2_current.load, com2_current.frequency,
+			com2_current.battery_level, com2_current.temperature);
+		upsdebugx(3, "COM2 status bits: b7=%d b6=%d b5=%d b4=%d b3=%d b2=%d b1=%d b0=%d",
+			com2_current.status_bits[0], com2_current.status_bits[1],
+			com2_current.status_bits[2], com2_current.status_bits[3],
+			com2_current.status_bits[4], com2_current.status_bits[5],
+			com2_current.status_bits[6], com2_current.status_bits[7]);
+	}
+	
+	return 1;
+	
+parse_error:
+	upsdebugx(2, "COM2: Parse error at field %d", field_count);
+	return 0;
+}
+
+/* COM2: Detect and track events based on status changes */
+static void com2_detect_events(void)
+{
+	int i;
+	int status_changed = 0;
+	time_t now = time(NULL);
+	char event_buf[128];
+	
+	/* Check if this is first run */
+	if (event_tracking.last_event_time == 0) {
+		memcpy(event_tracking.prev_status, com2_current.status_bits, 8);
+		event_tracking.last_event_time = now;
+		return;
+	}
+	
+	/* Detect status bit changes */
+	for (i = 0; i < 8; i++) {
+		if (event_tracking.prev_status[i] != com2_current.status_bits[i]) {
+			status_changed = 1;
+			break;
+		}
+	}
+	
+	if (!status_changed) {
+		return;
+	}
+	
+	/* Analyze specific transitions */
+	event_buf[0] = '\0';
+	
+	/* b7: Power failure/restore */
+	if (event_tracking.prev_status[0] == 0 && com2_current.status_bits[0] == 1) {
+		snprintf(event_buf, sizeof(event_buf), "power_failure");
+	} else if (event_tracking.prev_status[0] == 1 && com2_current.status_bits[0] == 0) {
+		snprintf(event_buf, sizeof(event_buf), "power_restore");
+	}
+	/* b5: AVR/Bypass on/off */
+	else if (event_tracking.prev_status[2] == 0 && com2_current.status_bits[2] == 1) {
+		snprintf(event_buf, sizeof(event_buf), "avr_bypass_active");
+	} else if (event_tracking.prev_status[2] == 1 && com2_current.status_bits[2] == 0) {
+		snprintf(event_buf, sizeof(event_buf), "avr_bypass_inactive");
+	}
+	/* b2: Test start/stop */
+	else if (event_tracking.prev_status[5] == 0 && com2_current.status_bits[5] == 1) {
+		snprintf(event_buf, sizeof(event_buf), "self_test_start");
+	} else if (event_tracking.prev_status[5] == 1 && com2_current.status_bits[5] == 0) {
+		snprintf(event_buf, sizeof(event_buf), "self_test_stop");
+	}
+	
+	if (event_buf[0] != '\0') {
+		snprintf(event_tracking.last_event, sizeof(event_tracking.last_event), "%s", event_buf);
+		event_tracking.last_event_time = now;
+		event_tracking.event_count++;
+		upsdebugx(1, "COM2: Event detected: %s", event_buf);
+	}
+	
+	/* Update previous status */
+	memcpy(event_tracking.prev_status, com2_current.status_bits, 8);
+}
+
+/* COM2: Update NUT variables from parsed data */
+static void com2_update_vars(void)
+{
+	time_t now = time(NULL);
+	int event_latched = 0;
+	
+	/* Detect events before updating vars */
+	com2_detect_events();
+	
+	/* Basic measurements */
+	dstate_setinfo("input.voltage", "%.1f", com2_current.input_voltage);
+	dstate_setinfo("output.voltage", "%.1f", com2_current.output_voltage);
+	dstate_setinfo("ups.load", "%.1f", com2_current.load);
+	dstate_setinfo("input.frequency", "%.1f", com2_current.frequency);
+	
+	/* Battery level (could be % or voltage depending on value range)
+	 * Heuristic: If > 50, assume percentage (0-100%)
+	 * If <= 50, check if it's in valid battery voltage range (10-60V)
+	 * Typical UPS battery voltages: 12V, 24V, 36V, 48V systems
+	 */
+	if (com2_current.battery_level > 50.0) {
+		/* Likely percentage (50-100%) */
+		dstate_setinfo("battery.charge", "%.1f", com2_current.battery_level);
+	} else if (com2_current.battery_level >= 10.0 && com2_current.battery_level <= 50.0) {
+		/* Ambiguous range - could be low percentage or voltage
+		 * Check if value looks like typical battery voltage */
+		if (com2_current.battery_level >= 11.0 && com2_current.battery_level <= 14.0) {
+			/* 12V system voltage range */
+			dstate_setinfo("battery.voltage", "%.2f", com2_current.battery_level);
+		} else if (com2_current.battery_level >= 22.0 && com2_current.battery_level <= 28.0) {
+			/* 24V system voltage range */
+			dstate_setinfo("battery.voltage", "%.2f", com2_current.battery_level);
+		} else if (com2_current.battery_level >= 33.0 && com2_current.battery_level <= 40.0) {
+			/* 36V system voltage range */
+			dstate_setinfo("battery.voltage", "%.2f", com2_current.battery_level);
+		} else if (com2_current.battery_level >= 44.0 && com2_current.battery_level <= 50.0) {
+			/* 48V system voltage range */
+			dstate_setinfo("battery.voltage", "%.2f", com2_current.battery_level);
+		} else {
+			/* Otherwise assume percentage */
+			dstate_setinfo("battery.charge", "%.1f", com2_current.battery_level);
+		}
+	} else {
+		/* Very low value - likely percentage */
+		dstate_setinfo("battery.charge", "%.1f", com2_current.battery_level);
+	}
+	
+	/* Temperature - validate range instead of just checking > 0 */
+	if (com2_current.temperature >= -20.0 && com2_current.temperature <= 100.0) {
+		dstate_setinfo("ups.temperature", "%.1f", com2_current.temperature);
+	}
+	
+	/* Status processing 
+	 * Bit mapping: status_bits[0]=b7, [1]=b6, [2]=b5, [3]=b4, [4]=b3, [5]=b2, [6]=b1, [7]=b0
+	 */
+	status_init();
+	alarm_init();
+	
+	/* b7 (status_bits[0]): Power failure */
+	if (com2_current.status_bits[0] == 1) {
+		status_set("OB");  /* On battery */
+	} else {
+		/* b1 (status_bits[6]): UPS output OFF */
+		if (com2_current.status_bits[6] == 1) {
+			status_set("OFF");
+		} else {
+			status_set("OL");  /* Online */
+		}
+	}
+	
+	/* b6 (status_bits[1]): Battery low */
+	if (com2_current.status_bits[1] == 1) {
+		status_set("LB");
+	}
+	
+	/* b5 (status_bits[2]): AVR active (Buck/Boost regulation) */
+	if (com2_current.status_bits[2] == 1) {
+		/* Determine AVR direction: Buck (reduce) vs Boost (increase) */
+		if (com2_current.input_voltage > com2_current.output_voltage) {
+			status_set("TRIM");  /* Buck/Reduce voltage */
+		} else if (com2_current.output_voltage > com2_current.input_voltage) {
+			status_set("BOOST");  /* Boost/Increase voltage */
+		}
+		/* Note: Removed inappropriate BYPASS status - this is line-interactive UPS */
+	}
+	
+	/* b4 (status_bits[3]): UPS fault */
+	if (com2_current.status_bits[3] == 1) {
+		alarm_set("UPS fault");
+	}
+	
+	/* b3 (status_bits[4]): Online/Offline/Battery fault status (multi-value: 0-3)
+	 * Values: 0=Online, 1=Offline, 2/3=Battery fault
+	 */
+	if (com2_current.status_bits[4] >= 2) {
+		status_set("RB");  /* Replace battery */
+		alarm_set("Battery failed - needs replacement");
+	}
+	
+	/* b2 (status_bits[5]): Self-test running */
+	if (com2_current.status_bits[5] == 1) {
+		status_set("TEST");
+		dstate_setinfo("ups.test.status", "in_progress");
+	} else {
+		/* Only set status when test is not running - don't report "done" constantly */
+		dstate_delinfo("ups.test.status");
+	}
+	
+	/* b0 (status_bits[7]): Beeper status */
+	if (com2_current.status_bits[7] == 1) {
+		dstate_setinfo("ups.beeper.status", "disabled");
+	} else {
+		dstate_setinfo("ups.beeper.status", "enabled");
+	}
+	
+	status_commit();
+	alarm_commit();
+	
+	/* Event latching - keep event visible for event_hold_time seconds */
+	if (event_tracking.last_event_time > 0 &&
+	    (now - event_tracking.last_event_time) <= event_hold_time) {
+		dstate_setinfo("ups.event.last", "%s", event_tracking.last_event);
+		dstate_setinfo("ups.event.time", "%ld", (long)event_tracking.last_event_time);
+		dstate_setinfo("ups.event.count", "%u", event_tracking.event_count);
+		event_latched = 1;
+	}
+	
+	/* Clear latched event info after hold time */
+	if (!event_latched && event_tracking.last_event[0] != '\0') {
+		dstate_delinfo("ups.event.last");
+		dstate_delinfo("ups.event.time");
+	}
+}
+
+/* Auto-detect protocol mode */
+static int detect_protocol(void)
+{
+	time_t now = time(NULL);
+	static int protocol_detected = 0;  /* One-time detection flag */
+	
+	/* Check cooldown period (10 seconds minimum between switches) */
+	if (last_mode_switch > 0 && (now - last_mode_switch) < 10) {
+		upsdebugx(2, "Protocol switch cooldown active");
+		return (current_protocol == PROTOCOL_COM1 || current_protocol == PROTOCOL_COM2) ? 1 : 0;
+	}
+	
+	/* If configured protocol is set, use it (manual override) */
+	if (configured_protocol != PROTOCOL_AUTO) {
+		current_protocol = configured_protocol;
+		last_mode_switch = now;
+		upsdebugx(1, "Using configured protocol: COM%d", current_protocol);
+		
+		/* Set speed once for configured protocol */
+		if (current_protocol == PROTOCOL_COM1) {
+			set_speed_if_needed(B1200);
+		} else if (current_protocol == PROTOCOL_COM2) {
+			set_speed_if_needed(B2400);
+		}
+		
+		return 1;
+	}
+	
+	/* First-time detection: try both protocols to find the best one */
+	if (!protocol_detected && current_protocol == PROTOCOL_AUTO) {
+		int com1_works = 0;
+		int com2_works = 0;
+		
+		upsdebugx(1, "First-time protocol detection: probing COM1 and COM2");
+		
+		/* Probe COM1 at 1200 baud */
+		upsdebugx(1, "Trying COM1 at 1200 baud (binary protocol)...");
+		set_speed_if_needed(B1200);
+		if (ups_getinfo()) {
+			com1_works = 1;
+			upsdebugx(1, "COM1 probe: SUCCESS - UPS responds to binary protocol");
+		} else {
+			upsdebugx(1, "COM1 probe: FAILED - no valid response");
+		}
+		
+		/* Probe COM2 at 2400 baud */
+		upsdebugx(1, "Trying COM2 at 2400 baud (ASCII protocol)...");
+		set_speed_if_needed(B2400);
+		if (ups_getinfo_com2()) {
+			com2_works = 1;
+			upsdebugx(1, "COM2 probe: SUCCESS - UPS responds to ASCII protocol");
+		} else {
+			upsdebugx(1, "COM2 probe: FAILED - no valid response");
+		}
+		
+		/* Prefer COM2 if both work (richer protocol, like Java driver preference) */
+		if (com2_works) {
+			current_protocol = PROTOCOL_COM2;
+			set_speed_if_needed(B2400);
+			protocol_detected = 1;
+			last_mode_switch = now;
+			upslogx(LOG_INFO, "Auto-detected protocol: COM2 (ASCII, 2400 baud) - preferred");
+			upsdebugx(1, "Using COM2: richer features (battery voltage, temperature, events)");
+			return 1;
+		} else if (com1_works) {
+			current_protocol = PROTOCOL_COM1;
+			set_speed_if_needed(B1200);
+			protocol_detected = 1;
+			last_mode_switch = now;
+			upslogx(LOG_INFO, "Auto-detected protocol: COM1 (binary, 1200 baud) - fallback");
+			upsdebugx(1, "Using COM1: COM2 not available on this UPS");
+			return 1;
+		}
+		
+		/* Neither protocol works on first try */
+		upsdebugx(1, "Protocol detection: Both COM1 and COM2 failed, will retry");
+		return 0;
+	}
+	
+	/* After initial detection, light healthcheck without redundant speed changes */
+	if (protocol_detected) {
+		if (current_protocol == PROTOCOL_COM1) {
+			/* Speed already set during detection - just verify communication */
+			if (ups_getinfo()) {
+				com1_fail_count = 0;
+				return 1;
+			} else {
+				com1_fail_count++;
+				upsdebugx(2, "COM1 failed (count: %d)", com1_fail_count);
+			}
+		} else if (current_protocol == PROTOCOL_COM2) {
+			/* Speed already set during detection - just verify communication */
+			if (ups_getinfo_com2()) {
+				com2_fail_count = 0;
+				return 1;
+			} else {
+				com2_fail_count++;
+				upsdebugx(2, "COM2 failed (count: %d)", com2_fail_count);
+			}
+		}
+	}
+	
+	/* Fallback: switch protocols if current one fails 3+ times */
+	if (com1_fail_count >= 3 && current_protocol == PROTOCOL_COM1) {
+		upslogx(LOG_WARNING, "COM1 failed %d times, trying COM2", com1_fail_count);
+		current_protocol = PROTOCOL_COM2;
+		com1_fail_count = 0;
+		last_mode_switch = now;
+		
+		set_speed_if_needed(B2400);
+		
+		if (ups_getinfo_com2()) {
+			com2_fail_count = 0;
+			upslogx(LOG_INFO, "Successfully switched to COM2");
+			return 1;
+		}
+		com2_fail_count++;
+	}
+	
+	if (com2_fail_count >= 3 && current_protocol == PROTOCOL_COM2) {
+		upslogx(LOG_WARNING, "COM2 failed %d times, trying COM1", com2_fail_count);
+		current_protocol = PROTOCOL_COM1;
+		com2_fail_count = 0;
+		last_mode_switch = now;
+		
+		set_speed_if_needed(B1200);
+		
+		if (ups_getinfo()) {
+			com1_fail_count = 0;
+			upslogx(LOG_INFO, "Successfully switched to COM1");
+			return 1;
+		}
+		com1_fail_count++;
+	}
+	
+	/* Both protocols failing - reset for retry */
+	if (com1_fail_count >= 3 && com2_fail_count >= 3) {
+		upsdebugx(1, "Both protocols failing, resetting detection");
+		com1_fail_count = 0;
+		com2_fail_count = 0;
+		protocol_detected = 0;  /* Allow re-detection */
+		current_protocol = PROTOCOL_AUTO;
+	}
+	
+	return 0;
+}
+
+/* ========== End COM2 Protocol Implementation ========== */
+
 static float input_voltage(void)
 {
 	unsigned int model;
@@ -461,13 +1196,23 @@ static float input_voltage(void)
 			}
 		}
 	} else if ( !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI")) {
+		/* IMP/OPTI: multiply by 2 (from ConCOM1Get.java line 663) */
 		tmp=raw_data[INPUT_VOLTAGE]*2.0;
 	} else {
 		tmp=linevoltage >= 220 ?
 			types[type].voltage[0] * raw_data[INPUT_VOLTAGE] + types[type].voltage[1] :
 			types[type].voltage[2] * raw_data[INPUT_VOLTAGE] + types[type].voltage[3];
 	}
-	if (tmp<0) tmp=0.0;
+	
+	/* Sanity checks from Java driver (ConCOM1Get.java lines 666-668) */
+	if (tmp < 0.0) {
+		tmp = 0.0;
+	}
+	if (tmp < 25.0) {
+		upsdebugx(3, "input.voltage: Very low value (%.1fV), possible power off", tmp);
+		tmp = 0.0;
+	}
+	
 	return tmp;
 }
 
@@ -609,26 +1354,66 @@ static float output_voltage(void)
 
 static float input_freq(void)
 {
-	if ( !strcmp(types[type].name, "BNT") || !strcmp(types[type].name, "KIN"))
-		return 4807.0/raw_data[INPUT_FREQUENCY];
-	else if ( !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI"))
-		return raw_data[INPUT_FREQUENCY];
-	return raw_data[INPUT_FREQUENCY] ?
-		1.0 / (types[type].freq[0] *
-				raw_data[INPUT_FREQUENCY] +
-						types[type].freq[1]) : 0;
+	float tmp = 0.0;
+	
+	if ( !strcmp(types[type].name, "BNT") || !strcmp(types[type].name, "KIN")) {
+		/* BNT/KIN use formula: 4807 / raw_value (from ConCOM1Get.java line 694) */
+		if (raw_data[INPUT_FREQUENCY] != 0) {
+			tmp = 4807.0 / raw_data[INPUT_FREQUENCY];
+		} else {
+			tmp = 0.0;
+		}
+	} else if ( !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI")) {
+		/* IMP/OPTI use direct value (from ConCOM1Get.java line 700) */
+		tmp = raw_data[INPUT_FREQUENCY];
+	} else {
+		/* Other models use formula from type configuration */
+		tmp = raw_data[INPUT_FREQUENCY] ?
+			1.0 / (types[type].freq[0] * raw_data[INPUT_FREQUENCY] + types[type].freq[1]) : 0;
+	}
+	
+	/* Sanity check: Java code limits to 90 Hz and checks voltage (lines 652-705) */
+	if (tmp > 90.0) {
+		upsdebugx(3, "input.frequency: Invalid value %.1f Hz, setting to 0", tmp);
+		tmp = 0.0;
+	}
+	
+	/* When input voltage is too low, frequency should be zero (Java line 703-705) */
+	if (input_voltage() <= 20.0) {
+		upsdebugx(3, "input.frequency: Input voltage too low (%.1fV), setting to 0", input_voltage());
+		tmp = 0.0;
+	}
+	
+	return tmp;
 }
 
 static float output_freq(void)
 {
-	if ( !strcmp(types[type].name, "BNT") || !strcmp(types[type].name, "KIN"))
-		return 4807.0/raw_data[OUTPUT_FREQUENCY];
-	else if ( !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI"))
-		return raw_data[OUTPUT_FREQUENCY];
-	return raw_data[OUTPUT_FREQUENCY] ?
-		1.0 / (types[type].freq[0] *
-				raw_data[OUTPUT_FREQUENCY] +
-						types[type].freq[1]) : 0;
+	float tmp = 0.0;
+	
+	if ( !strcmp(types[type].name, "BNT") || !strcmp(types[type].name, "KIN")) {
+		/* BNT/KIN use formula: 4807 / raw_value (from ConCOM1Get.java line 646) */
+		if (raw_data[OUTPUT_FREQUENCY] != 0) {
+			tmp = 4807.0 / raw_data[OUTPUT_FREQUENCY];
+		} else {
+			tmp = 0.0;
+		}
+	} else if ( !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI")) {
+		/* IMP/OPTI use direct value (from ConCOM1Get.java line 648) */
+		tmp = raw_data[OUTPUT_FREQUENCY];
+	} else {
+		/* Other models use formula from type configuration */
+		tmp = raw_data[OUTPUT_FREQUENCY] ?
+			1.0 / (types[type].freq[0] * raw_data[OUTPUT_FREQUENCY] + types[type].freq[1]) : 0;
+	}
+	
+	/* Sanity check: Java code limits to 90 Hz (lines 652-654) */
+	if (tmp > 90.0) {
+		upsdebugx(3, "output.frequency: Invalid value %.1f Hz, setting to 0", tmp);
+		tmp = 0.0;
+	}
+	
+	return tmp;
 }
 
 static float load_level(void)
@@ -771,6 +1556,21 @@ void upsdrv_updateinfo(void)
 {
 	char	val[32];
 
+	/* Auto-detect or use configured protocol */
+	if (!detect_protocol()) {
+		/* Both protocols failed */
+		dstate_datastale();
+		return;
+	}
+	
+	/* Use COM2 protocol if detected */
+	if (current_protocol == PROTOCOL_COM2) {
+		com2_update_vars();
+		dstate_dataok();
+		return;
+	}
+	
+	/* COM1 protocol (original implementation) */
 	if (!ups_getinfo()) {
 		/* https://github.com/networkupstools/nut/issues/356 */
 		upsdebugx(1, "%s: failed to ups_getinfo() once, retrying for slower devices", __func__);
@@ -825,18 +1625,88 @@ void upsdrv_updateinfo(void)
 		status_set("OB");
 	}
 
-	if (raw_data[STATUS_A] & LOW_BAT)  status_set("LB");
-
-	if (raw_data[STATUS_A] & AVR_ON) {
-		input_voltage() < linevoltage ?
-			status_set("BOOST") : status_set("TRIM");
+	if (raw_data[STATUS_A] & LOW_BAT) {
+		status_set("LB");
+		upsdebugx(2, "STATUS: Low Battery");
 	}
 
-	if (raw_data[STATUS_A] & OVERLOAD)  status_set("OVER");
+	/* AVR with direction detection (from ConCOM1Get.java lines 336-364) */
+	if (raw_data[STATUS_A] & AVR_ON) {
+		int input_v = input_voltage();
+		int output_v = output_voltage();
+		if (input_v > output_v) {
+			status_set("TRIM");  /* Buck/Reduce voltage */
+			upsdebugx(2, "STATUS: AVR Buck (reducing voltage: %d→%d)", input_v, output_v);
+		} else if (output_v > input_v) {
+			status_set("BOOST");  /* Boost/Increase voltage */
+			upsdebugx(2, "STATUS: AVR Boost (increasing voltage: %d→%d)", input_v, output_v);
+		} else {
+			/* AVR active but voltages equal - rare but possible */
+			upsdebugx(2, "STATUS: AVR active (voltage regulation)");
+		}
+	}
 
-	if (raw_data[STATUS_B] & BAD_BAT)  status_set("RB");
+	if (raw_data[STATUS_A] & OVERLOAD) {
+		status_set("OVER");
+		upsdebugx(2, "STATUS: Overload");
+	}
 
-	if (raw_data[STATUS_B] & TEST)  status_set("TEST");
+	/* Battery failure detection (from ConCOM1Get.java lines 389-421) */
+	if (raw_data[STATUS_B] & BAD_BATTERY) {
+		status_set("RB");  /* Replace Battery */
+		dstate_setinfo("ups.alarm", "Battery failed - needs replacement");
+		upsdebugx(2, "STATUS: Battery FAILED (needs replacement)");
+	}
+
+	if (raw_data[STATUS_B] & TEST) {
+		status_set("TEST");
+		upsdebugx(2, "STATUS: Battery test in progress");
+	}
+
+	/* Parse beeper status (from ConCOM1Get.java lines 495-499) */
+	/* Note: Inverted logic - bit 0=ON, 1=OFF */
+	if (raw_data[STATUS_B] & BEEPER_STATUS) {
+		dstate_setinfo("ups.beeper.status", "disabled");
+		upsdebugx(3, "Beeper: disabled");
+	} else {
+		dstate_setinfo("ups.beeper.status", "enabled");
+		upsdebugx(3, "Beeper: enabled");
+	}
+
+	/* Prevent dstate.c from incorrectly inferring DISCHRG when online.
+	 * 
+	 * Issue: Battery charge naturally fluctuates (89% -> 92% -> 89%), and dstate.c
+	 * (lines 1903-1915) will infer DISCHRG whenever charge drops, even when UPS
+	 * is online. This is wrong - battery can't discharge when on mains!
+	 * 
+	 * Previous attempt: Only set CHRG when charge increased >0.5%
+	 * Problem: When charge dropped, driver set nothing, dstate.c inferred DISCHRG
+	 * 
+	 * Correct solution: Always set CHRG when online and battery < 100%. This
+	 * prevents dstate.c from ever inferring DISCHRG when online.
+	 * 
+	 * Rationale: When UPS is online with battery <100%, it's in charging/float
+	 * mode (either actively charging or maintaining charge). It's accurate to
+	 * show CHRG in both cases.
+	 * 
+	 * When online, battery status should be:
+	 * - CHRG when battery < 100% (charging or float mode)
+	 * - Nothing when battery = 100% (fully charged)
+	 * - Never DISCHRG (that's only for OB - on battery)
+	 */
+	if (!(raw_data[STATUS_A] & MAINS_FAILURE)) {
+		/* Online (not on battery) */
+		double curr_charge = batt_level();
+		
+		if (curr_charge < 99.5) {
+			/* Battery not full -> UPS is charging/maintaining */
+			status_set("CHRG");
+			upsdebugx(3, "Battery: maintaining/charging (%.1f%%)", curr_charge);
+		}
+		/* When battery full (>=99.5%), don't set CHRG.
+		 * Never set DISCHRG when online - that would be wrong!
+		 */
+	}
 
 	status_commit();
 
@@ -867,6 +1737,56 @@ void upsdrv_initups(void)
 {
 	int tmp;
 	unsigned int i;
+	const char *val;
+
+	/* Parse COM2 protocol options */
+	if (testvar("protocol_mode")) {
+		val = getval("protocol_mode");
+		if (!strcasecmp(val, "com1")) {
+			configured_protocol = PROTOCOL_COM1;
+			upsdebugx(1, "Protocol mode set to: COM1");
+		} else if (!strcasecmp(val, "com2")) {
+			configured_protocol = PROTOCOL_COM2;
+			upsdebugx(1, "Protocol mode set to: COM2");
+		} else if (!strcasecmp(val, "auto")) {
+			configured_protocol = PROTOCOL_AUTO;
+			upsdebugx(1, "Protocol mode set to: AUTO");
+		} else {
+			fatalx(EXIT_FAILURE, "Invalid protocol_mode '%s' (must be auto, com1, or com2)", val);
+		}
+	}
+	
+	/* com2_command option removed - driver now automatically alternates between Q1 and DQ1
+	 * like the original Java driver (ConCOM2Set.java lines 186-194)
+	 */
+	
+	if (testvar("event_hold")) {
+		char *endptr = NULL;
+		long tmpval;
+		val = getval("event_hold");
+		
+		tmpval = strtol(val, &endptr, 10);
+		if (endptr == val || *endptr != '\0' || tmpval <= 0 || tmpval > 300) {
+			fatalx(EXIT_FAILURE, "Invalid event_hold '%s' (must be 1-300 seconds)", val);
+		}
+		event_hold_time = (unsigned int)tmpval;
+		upsdebugx(1, "Event hold time set to: %u seconds", event_hold_time);
+	}
+	
+	if (testvar("allow_control")) {
+		val = getval("allow_control");
+		if (!strcasecmp(val, "yes") || !strcasecmp(val, "true") || !strcasecmp(val, "1")) {
+			allow_control = 1;
+			upsdebugx(1, "Dangerous control commands enabled");
+			upslogx(LOG_WARNING, "allow_control=yes - dangerous shutdown commands are enabled");
+		} else {
+			allow_control = 0;
+		}
+	}
+	
+	/* Initialize event tracking */
+	memset(&event_tracking, 0, sizeof(event_tracking));
+	memset(&com2_current, 0, sizeof(com2_current));
 
 	/* check manufacturer name from arguments */
 	if (testvar("manufacturer"))
@@ -1020,6 +1940,20 @@ void upsdrv_help(void)
 	/*      12345678901234567890123456789012345678901234567890123456789012345678901234567890 MAX */
 	printf("\n");
 	printf("Specify UPS information in the ups.conf file.\n");
+	printf("\n");
+	printf("COM2 Protocol Options (ASCII protocol at 2400 baud):\n");
+	printf(" protocol_mode: Protocol to use: 'auto', 'com1', 'com2' (default: 'auto')\n");
+	printf("                 auto: probes both protocols, prefers COM2 if UPS supports it\n");
+	printf("                       (COM2 has richer features: events, temperature, battery voltage)\n");
+	printf("                 com1: binary protocol at 1200 baud (older models)\n");
+	printf("                 com2: ASCII protocol at 2400 baud (newer models, IMP-525 etc.)\n");
+	printf("                NOTE: COM2 automatically alternates between Q1 and DQ1 commands\n");
+	printf("                      like the original Java driver (no configuration needed)\n");
+	printf(" event_hold:    Event latch time in seconds (default: 20, range: 1-300)\n");
+	printf(" allow_control: Enable dangerous commands: 'yes' or 'no' (default: 'no')\n");
+	printf("                When 'yes', enables shutdown.stayoff.dangerous command\n");
+	printf("\n");
+	printf("COM1 Protocol Options (binary protocol at 1200 baud):\n");
 	printf(" type:          Type of UPS: 'Trust','Egys','KP625AP','IMP','KIN','BNT',\n");
 	printf("                 'BNT-other', 'OPTI' (default: 'Trust')\n");
 	printf("                'BNT-other' is a special type intended for BNT 100-120V models,\n");
@@ -1077,6 +2011,16 @@ void upsdrv_help(void)
 	printf("#   batteryPercentage = {1.0000,0.0000,0.0000,1.0000,0.0000}\n");
 	printf("#   voltage = {2.0000,0.0000,2.0000,0.0000}\n");
 	printf("    nobt\n");
+	printf("\n");
+	printf("Example for COM2 protocol:\n");
+	printf("[PowerCom-COM2]\n");
+	printf("    driver = powercom\n");
+	printf("    port = /dev/ttyS0\n");
+	printf("    desc = \"PowerCom Imperial with COM2 protocol\"\n");
+	printf("    protocol_mode = com2\n");
+	printf("    event_hold = 20\n");
+	printf("#   allow_control = yes  # Enable dangerous commands\n");
+	printf("# NOTE: COM2 automatically alternates between Q1 and DQ1 commands\n");
 	return;
 }
 
@@ -1091,9 +2035,18 @@ void upsdrv_initinfo(void)
 	unsigned int	model = 0;
 	static char	buf[20];
 
-	/* Setup Model and LineVoltage */
-	if (!strncmp(types[type].name, "BNT",3) || !strcmp(types[type].name, "KIN") || !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI")) {
-		if (!ups_getinfo()) return;
+	/* Auto-detect protocol (COM1 or COM2) like Java driver */
+	if (!detect_protocol()) {
+		upslogx(LOG_ERR, "Failed to detect UPS protocol (tried COM1 and COM2)");
+		dstate_datastale();
+		return;
+	}
+	
+	/* Setup Model and LineVoltage - only for COM1 (binary protocol) */
+	/* COM2 (ASCII protocol) doesn't have model detection bytes */
+	if (current_protocol == PROTOCOL_COM1 && 
+	    (!strncmp(types[type].name, "BNT",3) || !strcmp(types[type].name, "KIN") || !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI"))) {
+		/* Note: detect_protocol() already called ups_getinfo() successfully */
 		/* Give "BNT-other" a chance! */
 		if (raw_data[MODELNAME]==0x42 || raw_data[MODELNAME]==0x4B || raw_data[MODELNAME]==0x4F){
 			/* Give "IMP" a chance also! */
@@ -1129,6 +2082,8 @@ void upsdrv_initinfo(void)
 		if (!strcmp(modelname, "Unknown"))
 			modelname=buf;
 		upsdebugx(1, "Detected: %s , %uV", buf, linevoltage);
+		
+		/* Battery test command is COM1-specific */
 		if (testvar("nobt") || dstate_getinfo("driver.flag.nobt")) {
 			upslogx(LOG_NOTICE, "nobt flag set, skipping battery test as requested");
 		}
@@ -1140,6 +2095,11 @@ void upsdrv_initinfo(void)
 				return;
 			}
 		}
+	} else if (current_protocol == PROTOCOL_COM2) {
+		/* COM2 protocol detected - use modelname from config or Unknown */
+		upsdebugx(1, "Using COM2 protocol (ASCII, 2400 baud)");
+		upsdebugx(1, "Model: %s (from config)", modelname);
+		/* Battery test for COM2 uses different commands (handled via instcmd) */
 	}
 
 	upsdebugx(1, "Values of arguments:");
@@ -1185,11 +2145,73 @@ void upsdrv_initinfo(void)
 	dstate_setinfo ("ups.serial", "%s", serialnumber);
 	dstate_setinfo ("ups.model.type", "%s", types[type].name);
 	dstate_setinfo ("input.voltage.nominal", "%u", linevoltage);
+	
+	/* Add output.voltage.nominal (same as input for line-interactive UPS) */
+	dstate_setinfo ("output.voltage.nominal", "%u", linevoltage);
+	
+	/* Add ups.power.nominal (VA rating from model number) if detected */
+	if (!strncmp(types[type].name, "BNT",3) || !strcmp(types[type].name, "KIN") || 
+	    !strcmp(types[type].name, "IMP") || !strcmp(types[type].name, "OPTI")) {
+		unsigned int model = 0;
+		
+		/* Extract model power rating */
+		if (!strcmp(types[type].name, "IMP")) {
+			model = IMPmodels[raw_data[MODELNUMBER]/16];
+		} else if (!strcmp(types[type].name, "KIN")) {
+			model = KINmodels[raw_data[MODELNUMBER]/16];
+		} else if (!strncmp(types[type].name, "BNT",3)) {
+			model = BNTmodels[raw_data[MODELNUMBER]/16];
+		} else if (!strcmp(types[type].name, "OPTI")) {
+			model = OPTImodels[raw_data[MODELNUMBER]/16];
+		}
+		
+		if (model > 0) {
+			dstate_setinfo("ups.power.nominal", "%u", model);
+			/* Estimate real power at 0.6 power factor (typical for UPS) */
+			dstate_setinfo("ups.realpower.nominal", "%u", (unsigned int)(model * 0.6));
+		}
+	}
+	
+	/* Add battery.voltage.nominal based on detected system */
+	if (current_protocol == PROTOCOL_COM2 && com2_current.battery_level > 0) {
+		/* Try to detect battery system voltage from current reading */
+		float batt_v = com2_current.battery_level;
+		if (batt_v >= 11.0 && batt_v <= 14.0) {
+			dstate_setinfo("battery.voltage.nominal", "12.0");
+		} else if (batt_v >= 22.0 && batt_v <= 28.0) {
+			dstate_setinfo("battery.voltage.nominal", "24.0");
+		} else if (batt_v >= 33.0 && batt_v <= 40.0) {
+			dstate_setinfo("battery.voltage.nominal", "36.0");
+		} else if (batt_v >= 44.0 && batt_v <= 50.0) {
+			dstate_setinfo("battery.voltage.nominal", "48.0");
+		}
+	}
 
 	/* now add the instant commands */
 	dstate_addcmd ("test.battery.start");
 	dstate_addcmd ("shutdown.return");
 	dstate_addcmd ("shutdown.stayoff");
+	
+	/* Add COM2-specific commands ONLY if actually using COM2 protocol
+	 * Note: Commands are added after protocol detection in upsdrv_initinfo(),
+	 * so current_protocol reflects the actual detected/configured protocol.
+	 */
+	if (current_protocol == PROTOCOL_COM2) {
+		dstate_addcmd ("test.battery.stop");
+		dstate_addcmd ("beeper.toggle");
+		dstate_addcmd ("beeper.enable");
+		dstate_addcmd ("beeper.disable");
+		upsdebugx(1, "Added COM2-specific commands (test.battery.stop, beeper.*)");
+		if (allow_control) {
+			dstate_addcmd ("shutdown.stayoff.dangerous");
+			upslogx(LOG_WARNING, "Dangerous shutdown commands enabled");
+		}
+	} else if (current_protocol == PROTOCOL_COM1) {
+		/* COM1 has beeper toggle via byte 0x05 */
+		dstate_addcmd ("beeper.toggle");
+		upsdebugx(1, "Added COM1 beeper.toggle command (byte 0x05)");
+	}
+	
 	upsh.instcmd = instcmd;
 }
 
@@ -1198,6 +2220,16 @@ void upsdrv_makevartable(void)
 {
 		/*        1         2         3         4         5         6         7         8 */
 		/*2345678901234567890123456789012345678901234567890123456789012345678901234567890 MAX */
+	/* COM2 protocol options */
+	addvar(VAR_VALUE, "protocol_mode",
+		"Protocol mode: 'auto', 'com1', or 'com2' (default: auto)");
+	/* com2_command removed - driver automatically alternates Q1/DQ1 like Java driver */
+	addvar(VAR_VALUE, "event_hold",
+		"Event latch duration in seconds (default: 20, range: 1-300)");
+	addvar(VAR_VALUE, "allow_control",
+		"Enable dangerous control commands: 'yes' or 'no' (default: no)");
+	
+	/* Original COM1 options */
 	addvar(VAR_VALUE, "type",
 		"Type of UPS: 'Trust','Egys','KP625AP','IMP','KIN','BNT','BNT-other','OPTI'\n"
 		" (default: 'Trust')");

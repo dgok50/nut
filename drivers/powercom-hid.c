@@ -28,7 +28,7 @@
 
 #include <ctype.h>	/* isdigit() */
 
-#define POWERCOM_HID_VERSION	"PowerCOM HID 0.74"
+#define POWERCOM_HID_VERSION	"PowerCOM HID 0.75"
 /* FIXME: experimental flag to be put in upsdrv_info */
 
 /* PowerCOM */
@@ -657,6 +657,8 @@ static hid_info_t powercom_hid2nut[] = {
 	{ "beeper.enable", 0, 0, "UPS.PowerSummary.AudibleAlarmControl", NULL, "1", HU_TYPE_CMD, NULL },
 	{ "beeper.disable", 0, 0, "UPS.PowerSummary.AudibleAlarmControl", NULL, "0", HU_TYPE_CMD, NULL },
 	{ "test.battery.start.quick", 0, 0, "UPS.Battery.Test", NULL, "1", HU_TYPE_CMD, NULL },
+	{ "test.battery.start.deep", 0, 0, "UPS.Battery.Test", NULL, "2", HU_TYPE_CMD, NULL },
+	{ "test.battery.stop", 0, 0, "UPS.Battery.Test", NULL, "3", HU_TYPE_CMD, NULL },
 	{ "load.on.delay", 0, 0, "UPS.PowerSummary.DelayBeforeStartup", NULL, NULL, HU_TYPE_CMD, powercom_startup_info },
 	{ "shutdown.return", 0, 0, "UPS.PowerSummary.DelayBeforeShutdown", NULL, NULL, HU_TYPE_CMD, powercom_shutdown_info },
 	{ "shutdown.stayoff", 0, 0, "UPS.PowerSummary.DelayBeforeShutdown", NULL, NULL, HU_TYPE_CMD, powercom_stayoff_info },
