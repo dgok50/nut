@@ -89,7 +89,7 @@
 #include <ctype.h>
 
 #define DRIVER_NAME	"PowerCom protocol UPS driver"
-#define DRIVER_VERSION	"0.27"
+#define DRIVER_VERSION	"0.28"
 
 /* driver description structure */
 upsdrv_info_t	upsdrv_info = {
@@ -1671,6 +1671,37 @@ void upsdrv_updateinfo(void)
 	} else {
 		dstate_setinfo("ups.beeper.status", "enabled");
 		upsdebugx(3, "Beeper: enabled");
+	}
+
+	/* Detect battery charging to prevent dstate.c from incorrectly inferring DISCHRG
+	 * when battery charge fluctuates slightly while online.
+	 * 
+	 * Issue: Battery charge naturally varies (89% -> 92% -> 89%), and dstate.c
+	 * (lines 1903-1915) would infer DISCHRG even when UPS is online, which is wrong.
+	 * 
+	 * Solution: Explicitly set CHRG when charge increases significantly (>0.5%)
+	 * while online. Never set DISCHRG when online.
+	 * 
+	 * When online, battery status should be:
+	 * - CHRG (actively charging) when charge increasing
+	 * - Nothing (float/idle) when charge stable
+	 * - Never DISCHRG (that's only for OB - on battery)
+	 */
+	if (!(raw_data[STATUS_A] & MAINS_FAILURE)) {
+		/* Online (not on battery) - track charging */
+		static double prev_charge = -1.0;
+		double curr_charge = battery_charge();
+		
+		if (prev_charge >= 0.0 && curr_charge > prev_charge + 0.5) {
+			/* Charge increasing significantly (>0.5%) -> charging */
+			status_set("CHRG");
+			upsdebugx(3, "Battery: charging (%.1f%% -> %.1f%%)", prev_charge, curr_charge);
+		}
+		/* Never set DISCHRG when online - that would be wrong!
+		 * dstate.c should not infer DISCHRG from minor charge fluctuations.
+		 */
+		
+		prev_charge = curr_charge;
 	}
 
 	status_commit();
